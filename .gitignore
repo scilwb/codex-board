@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.data/
+artifacts/
+test-results/
+playwright-report/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.vsix
+.DS_Store
+# Local acceptance helper for the superseded URI-based bridge.
+scripts/verify-live.mjs

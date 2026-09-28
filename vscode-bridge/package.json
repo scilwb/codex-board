@@ -1,0 +1,19 @@
+{
+  "name": "codex-board-bridge",
+  "displayName": "Codex Board Bridge",
+  "description": "Reveal the matching Codex conversation tab from the local Codex Board.",
+  "version": "0.1.1",
+  "publisher": "local-codex-board",
+  "license": "MIT",
+  "engines": { "vscode": "^1.100.0" },
+  "categories": ["Other"],
+  "main": "./extension.cjs",
+  "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["ui"],
+  "contributes": {
+    "commands": [
+      { "command": "codexBoard.connect", "title": "Codex Board: Connect" },
+      { "command": "codexBoard.open", "title": "Codex Board: Open Board" }
+    ]
+  }
+}
