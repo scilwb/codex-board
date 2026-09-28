@@ -102,8 +102,9 @@ try {
     await page.reload();
     const edge = page.locator(`.react-flow__edge[data-id="${edgeId}"]`);
     await expect(edge).toBeVisible();
-    // A user's click on the rendered line selects the edge editor.
-    await edge.locator('.react-flow__edge-interaction').click({ force: true });
+    // Click the visible relation label. A routed SVG line's bounding-box
+    // center can be empty canvas; normal clicks also wait for layout stability.
+    await edge.locator('.react-flow__edge-textwrapper').click();
     await expect(page.getByTestId('edge-type')).toHaveValue('serial');
     await page.getByTestId('delete-edge').click();
     await expect.poll(() => server.board.store.graph().edges.length).toBe(0);
