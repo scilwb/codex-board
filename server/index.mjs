@@ -196,9 +196,11 @@ export function createServer(options = {}) {
           items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] }],
         });
       }
-      // Release app-server's live agent after the metadata operation. This also
-      // flushes durable history before a different VS Code process resumes it.
+      // Flush history, then wait for the metadata process to exit. Unsubscribe
+      // alone can leave the native writer locked until its 30-second idle exit,
+      // making VS Code's immediate resume fail with "already has an active writer".
       await appServer.request('thread/unsubscribe', { threadId: created.id });
+      await appServer.stopAndWait?.();
       if (typeof created.path === 'string' && !existsSync(created.path)) {
         throw fail(`Codex 尚未持久化新对话 ${created.id}，暂时无法在 VS Code 中打开。`, 502);
       }
@@ -232,7 +234,10 @@ export function createServer(options = {}) {
         throw fail(`${inheriting ? '继承' : '对话创建'}未完成：${error.message}。本次未完成的对话已归档，交接内容可以保留后重试。`, 502);
       }
       throw error;
-    } finally { operationInFlight = false; }
+    } finally {
+      try { await appServer.stopAndWait?.(); }
+      finally { operationInFlight = false; }
+    }
   }
 
   const server = http.createServer(async (request, response) => {

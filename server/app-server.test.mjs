@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -43,6 +43,90 @@ createInterface({ input: process.stdin }).on('line', line => {
   } finally {
     client.stop();
     await delay(150);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('App Server 交接等待进程退出，返回后其他进程可立即取得写锁', { timeout: 5000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'codex-board-writer-release-'));
+  const binary = join(directory, 'fake-codex');
+  const lock = join(directory, 'writer.lock');
+  writeFileSync(binary, `#!/usr/bin/env node
+const { createInterface } = require('node:readline');
+const { openSync, closeSync, unlinkSync } = require('node:fs');
+const { join } = require('node:path');
+const lock = join(process.env.CODEX_HOME, 'writer.lock');
+let writer;
+setInterval(() => {}, 1000);
+process.on('exit', () => {
+  if (writer === undefined) return;
+  closeSync(writer);
+  unlinkSync(lock);
+});
+process.on('SIGTERM', () => setTimeout(() => process.exit(0), 180));
+createInterface({ input: process.stdin }).on('line', line => {
+  const message = JSON.parse(line);
+  if (message.id === undefined) return;
+  let response;
+  try {
+    if (message.method === 'writer/claim') writer = openSync(lock, 'wx');
+    response = { id: message.id, result: { pid: process.pid } };
+  } catch {
+    response = { id: message.id, error: { code: -32000, message: 'already has an active writer' } };
+  }
+  process.stdout.write(JSON.stringify(response) + '\\n');
+});
+`, { mode: 0o700 });
+  const first = new AppServerClient({ codexHome: directory, binary, idleTimeoutMs: 0 });
+  const successor = new AppServerClient({ codexHome: directory, binary, idleTimeoutMs: 0 });
+  try {
+    await first.request('writer/claim', {});
+    await successor.ready();
+    const child = first.child;
+    let exited = false;
+    let resolved = false;
+    child.once('exit', () => { exited = true; });
+    const stopping = first.stopAndWait().then(() => { resolved = true; });
+
+    await delay(40);
+    assert.equal(resolved, false, 'handoff cannot finish while shutdown is pending');
+    assert.equal(exited, false, 'the original writer is still alive');
+    assert.equal(existsSync(lock), true, 'writer ownership survives unsubscribe/shutdown initiation');
+    await assert.rejects(successor.request('writer/claim', {}), /active writer/);
+
+    await stopping;
+    assert.equal(exited, true, 'handoff resolves only after the child exit event');
+    assert.equal(existsSync(lock), false, 'original writer released its lock');
+    assert.equal((await successor.request('writer/claim', {})).pid, successor.child.pid);
+  } finally {
+    await Promise.all([first.stopAndWait(), successor.stopAndWait()]);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('App Server 不响应 SIGTERM 时交接会限时强制退出', { timeout: 3000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'codex-board-force-stop-'));
+  const binary = join(directory, 'fake-codex');
+  writeFileSync(binary, `#!/usr/bin/env node
+const { createInterface } = require('node:readline');
+setInterval(() => {}, 1000);
+process.on('SIGTERM', () => {});
+createInterface({ input: process.stdin }).on('line', line => {
+  const message = JSON.parse(line);
+  if (message.id === undefined) return;
+  process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + '\\n');
+});
+`, { mode: 0o700 });
+  const client = new AppServerClient({ codexHome: directory, binary, idleTimeoutMs: 0 });
+  try {
+    await client.ready();
+    const child = client.child;
+    await client.stopAndWait({ graceMs: 50, timeoutMs: 1000 });
+    assert.equal(child.signalCode, 'SIGKILL', 'unresponsive child is killed after the grace period');
+    assert.equal(client.child, null);
+    assert.equal(client.pending.size, 0);
+  } finally {
+    await client.stopAndWait({ graceMs: 50, timeoutMs: 1000 });
     rmSync(directory, { recursive: true, force: true });
   }
 });

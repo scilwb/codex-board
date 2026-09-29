@@ -45,7 +45,7 @@ async function setup(t, options = {}) {
       return {};
     }
     throw new Error(`Unexpected operation: ${method}`);
-  } };
+  }, async stopAndWait() { await options.stopAndWait?.(); } };
   const server = createServer({ ...fixture, appServer, disableActions: options.disableActions, pollIntervalMs: 100 });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -160,6 +160,29 @@ test('继承校验在创建前完成，允许显式清空项目与任务', async
   assert.equal(calls.length, 0);
   const created = (await request(url, 'POST', { prompt: '继续', projectId: null, taskId: null })).body.thread;
   assert.equal((await request('/api/snapshot')).body.organization.assignments[created.id], undefined);
+});
+
+test('继承响应与发布等待创建进程释放写锁，期间不接受第二次创建', async t => {
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const stopping = new Promise(resolve => { entered = resolve; });
+  let stops = 0;
+  const { fixture, request, server } = await setup(t, { async stopAndWait() {
+    if (++stops === 1) { entered(); await gate; }
+  } });
+  let returned = false;
+  const creation = request(`/api/threads/${fixture.ids[0]}/inherit`, 'POST', { prompt: '交接资料' })
+    .then(result => { returned = true; return result; });
+  t.after(() => release());
+  await stopping;
+  assert.equal(returned, false, 'HTTP success must not race the native writer exit');
+  assert.equal(Object.values(server.board.store.state.managedThreads).filter(thread => thread.inheritance).length, 0);
+  const concurrent = await request(`/api/threads/${fixture.ids[0]}/inherit`, 'POST', { prompt: '另一份资料' });
+  assert.equal(concurrent.status, 409);
+  release();
+  const result = await creation;
+  assert.equal(result.status, 201);
+  assert.ok(server.board.store.inheritance(result.body.thread.id));
 });
 
 test('注入失败归档此次空对话，来源保持原样，重试可成功', async t => {

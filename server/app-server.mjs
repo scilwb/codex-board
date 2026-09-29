@@ -126,6 +126,30 @@ export class AppServerClient {
     this.idleTimer.unref();
   }
 
+  async stopAndWait({ graceMs = 1000, timeoutMs = 5000 } = {}) {
+    const child = this.child;
+    if (!child) return;
+    // thread/unsubscribe can acknowledge before the native thread writer has
+    // been released. Hand the thread to VS Code only after our process exits.
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
+      this.stop();
+      return;
+    }
+    await new Promise((resolve, reject) => {
+      const finish = error => {
+        clearTimeout(forceTimer);
+        clearTimeout(deadline);
+        child.off('exit', exited);
+        error ? reject(error) : resolve();
+      };
+      const exited = () => finish();
+      const forceTimer = setTimeout(() => child.kill('SIGKILL'), graceMs);
+      const deadline = setTimeout(() => finish(new Error('Codex 创建进程尚未退出，对话暂时无法交给 VS Code。')), timeoutMs);
+      child.once('exit', exited);
+      this.stop();
+    });
+  }
+
   stop() {
     this.cancelIdleShutdown();
     const child = this.child;
