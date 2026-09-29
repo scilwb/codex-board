@@ -7,9 +7,11 @@ import {
 import {
   ArrowUpRight, Check, ChevronDown, Copy, FolderOpen, GitBranch,
   GitFork, Link2, LoaderCircle, Map as MapIcon, Plus, Search, Trash2, X, Pencil, Layers,
+  Bell, BellOff, MessageSquare, RefreshCw, ArrowRightToLine,
 } from 'lucide-react';
 import '@xyflow/react/dist/style.css';
 import { routeAroundCards } from './edgeRouting.js';
+import { activityPresentation, createActivityTracker } from './activity.js';
 import './styles.css';
 
 const RELATIONS = { serial: '串行', parallel: '并行', reference: '参考' };
@@ -41,33 +43,43 @@ function projectKey(thread) { return thread.cwd || thread.project || '未知文�
 function shortPath(value) { return (value || '').replace(/^\/home\/[^/]+\//, '~/'); }
 function projectName(value) { return value.split('/').filter(Boolean).at(-1) || value; }
 function titleOf(thread) { return thread?.title?.trim() || '未命名对话'; }
+function parentOf(thread) { return thread?.inheritedFromId || thread?.forkedFromId; }
 function edgeSignature(edges) {
   return JSON.stringify(edges.map(({ id, source, target, type }) => ({ id, source, target, type })).sort((a, b) => a.id.localeCompare(b.id)));
 }
 
+function ActivityBadge({ thread }) {
+  const activity = activityPresentation(thread);
+  return <span className={`activity-badge ${activity.status}`} data-status={activity.status} title={activity.reason} data-testid={`activity-${thread.id}`}><span className={`status-dot ${activity.status}`} aria-hidden="true" />{activity.label}</span>;
+}
+
 const SessionCard = React.memo(function SessionCard({ id, data, selected }) {
-  const { thread, onCopy, onOpen, onFork, canFork, canOpen, opening, project, task } = data;
+  const { thread, onCopy, onOpen, onFork, onInherit, canFork, canInherit, canOpen, opening, project, task, timeLabel } = data;
   return (
-    <article className={`session-card ${selected ? 'is-selected' : ''}`} data-testid={`session-node-${id}`}>
+    <article className={`session-card ${selected ? 'is-selected' : ''}`} data-status={activityPresentation(thread).status} data-testid={`session-node-${id}`}>
       <Handle type="target" position={Position.Left} className="connection-handle" data-testid={`session-target-${id}`} aria-label="连接到此对话" />
       <div className="card-heading">
-        <span className={`status-dot ${thread.status === 'active' ? 'active' : ''}`} title={thread.status === 'active' ? '运行中' : thread.status === 'idle' ? '空闲' : '运行状态未知'} />
-        <span className="card-time">{relativeTime(thread.updatedAt)}</span>
-        <span className="card-branch" title={`Git 分支：${thread.branch || '未知'}`}><GitBranch size={10} /><span>{thread.branch || '分支未知'}</span></span>
-        {thread.forkedFromId && <span className="fork-badge"><GitFork size={11} /> Fork</span>}
+        <ActivityBadge thread={thread} />
+        <span className="card-time">{timeLabel}</span>
       </div>
       <h3 title={titleOf(thread)}>{titleOf(thread)}</h3>
       <p className="card-preview">{thread.preview || '暂无内容预览'}</p>
-      <div className={`card-taxonomy ${project ? '' : 'unassigned'}`} title={project ? `${project.name}${task ? ` / ${task.name}` : ''}` : '未归类'}><span>{project?.name || '未归类'}</span>{task && <><span className="taxonomy-separator">/</span><span>{task.name}</span></>}</div>
+      <div className="card-meta">
+        <div className={`card-taxonomy ${project ? '' : 'unassigned'}`} title={project ? `${project.name}${task ? ` / ${task.name}` : ''}` : '未归类'}><span>{project?.name || '未归类'}</span>{task && <><span className="taxonomy-separator">/</span><span>{task.name}</span></>}</div>
+        <span className="card-branch" title={`Git 分支：${thread.branch || '未知'}`}><GitBranch size={10} /><span>{thread.branch || '分支未知'}</span></span>
+        {thread.inheritedFromId && <span className="inherit-badge" title="由交接提示词继承的新对话"><ArrowRightToLine size={11} />继承</span>}
+        {thread.forkedFromId && <span className="fork-badge"><GitFork size={11} /> Fork</span>}
+      </div>
       <div className="card-actions nodrag nopan">
         <button className="card-open" disabled={!canOpen} data-testid={`open-${id}`} onClick={(event) => { event.stopPropagation(); onOpen(thread); }}>{opening ? <LoaderCircle size={14} className="spin" /> : <ArrowUpRight size={14} />}{opening ? '正在定位…' : 'VS Code'}</button>
+        <button className="card-inherit" title="用交接提示词继承为新对话" disabled={!canInherit} data-testid={`inherit-${id}`} onClick={(event) => { event.stopPropagation(); onInherit(thread); }}><ArrowRightToLine size={13} /><span>继承</span></button>
         <button className="card-copy" title="复制对话 ID" aria-label="复制对话 ID" data-testid={`copy-${id}`} onClick={(event) => { event.stopPropagation(); onCopy(thread.id); }}><Copy size={13} /><span>ID</span></button>
         <button className="icon-button fork-button" title="从此对话 Fork" aria-label="从此对话 Fork" disabled={!canFork} data-testid={`fork-${id}`} onClick={(event) => { event.stopPropagation(); onFork(thread); }}><GitFork size={14} /></button>
       </div>
       <Handle type="source" position={Position.Right} className="connection-handle" data-testid={`session-source-${id}`} aria-label="从此对话连线" />
     </article>
   );
-});
+}, (previous, next) => previous.id === next.id && previous.selected === next.selected && previous.data === next.data);
 const nodeTypes = { session: SessionCard };
 
 function RoutedEdge(props) {
@@ -96,12 +108,21 @@ function App() {
   const [windowPicker, setWindowPicker] = useState(null);
   const [openingThreadId, setOpeningThreadId] = useState(null);
   const [toast, setToast] = useState(null);
+  const [activityNotices, setActivityNotices] = useState([]);
+  const [activityNotifications, setActivityNotifications] = useState(() => { try { return localStorage.getItem('codex-board.activity-notifications') !== 'off'; } catch { return true; } });
   const [workspaceOptions, setWorkspaceOptions] = useState([]);
   const [saving, setSaving] = useState(false);
+  const [clockMinute, setClockMinute] = useState(() => Math.floor(Date.now() / 60_000));
   const flow = useRef(null);
   const positions = useRef({});
+  const positionRevisions = useRef(new Map());
+  const positionFallbacks = useRef(new Map());
   const dragging = useRef(new Set());
   const localEdges = useRef(null);
+  const edgeRevision = useRef(0);
+  const confirmedGraph = useRef(emptyGraph);
+  const layoutPositions = useRef(new Map());
+  const snapshotGeneration = useRef(0);
   const graph = useRef(emptyGraph);
   const lastSnapshot = useRef(0);
   const toastTimer = useRef(null);
@@ -109,6 +130,8 @@ function App() {
   const mounted = useRef(true);
   const saveQueue = useRef(Promise.resolve());
   const opening = useRef(false);
+  const trackActivity = useRef(createActivityTracker());
+  const activityNotificationsEnabled = useRef(activityNotifications);
   const windowTargets = useRef((() => { try { return JSON.parse(localStorage.getItem('codex-board.window-targets') || '{}'); } catch { return {}; } })());
   const selectionKey = `${selectedProject}|${selectedTask}|${folder}|${branch}|${search}`;
 
@@ -120,23 +143,57 @@ function App() {
 
   const receiveSnapshot = useCallback((next) => {
     if (!next || !Array.isArray(next.threads)) return;
+    snapshotGeneration.current++;
+    const notices = trackActivity.current(next.threads);
+    if (activityNotificationsEnabled.current && notices.length) setActivityNotices((current) => [...current, ...notices].slice(-3));
     lastSnapshot.current = Date.now();
     const incoming = { positions: {}, edges: [], ...next.graph };
+    confirmedGraph.current = incoming;
+    const threadIds = new Set(next.threads.map((thread) => thread.id));
+    for (const cache of [layoutPositions.current, positionRevisions.current, positionFallbacks.current]) {
+      for (const id of cache.keys()) if (!threadIds.has(id)) cache.delete(id);
+    }
     for (const [id, position] of Object.entries(positions.current)) {
       const saved = incoming.positions[id];
       if (!dragging.current.has(id) && saved && saved.x === position.x && saved.y === position.y) delete positions.current[id];
     }
     if (localEdges.current && edgeSignature(incoming.edges) === edgeSignature(localEdges.current)) localEdges.current = null;
     graph.current = { positions: { ...incoming.positions, ...positions.current }, edges: localEdges.current || incoming.edges };
-    setSnapshot({ ...next, graph: graph.current, organization: next.organization || emptyOrganization, capabilities: next.capabilities || {} });
+    const nextState = { ...next, graph: graph.current, organization: next.organization || emptyOrganization, capabilities: next.capabilities || {} };
+    setSnapshot((current) => {
+      if (JSON.stringify(current) === JSON.stringify(nextState)) return current;
+      const previousThreads = new Map(current.threads.map((thread) => [thread.id, thread]));
+      return { ...nextState, threads: next.threads.map((thread) => {
+        const previous = previousThreads.get(thread.id);
+        return previous && JSON.stringify(previous) === JSON.stringify(thread) ? previous : thread;
+      }), organization: JSON.stringify(current.organization) === JSON.stringify(nextState.organization) ? current.organization : nextState.organization };
+    });
     setError(next.error || '');
     setLoading(false);
   }, []);
 
+  const refreshSnapshot = useCallback(async () => {
+    const generation = snapshotGeneration.current;
+    try {
+      const next = await api('/api/snapshot');
+      if (mounted.current && snapshotGeneration.current === generation) receiveSnapshot(next);
+    } catch (err) {
+      if (mounted.current && snapshotGeneration.current === generation) throw err;
+    }
+  }, [receiveSnapshot]);
+
+  const toggleActivityNotifications = () => {
+    const enabled = !activityNotifications;
+    activityNotificationsEnabled.current = enabled;
+    setActivityNotifications(enabled);
+    if (!enabled) setActivityNotices([]);
+    try { localStorage.setItem('codex-board.activity-notifications', enabled ? 'on' : 'off'); } catch { /* Browser storage may be disabled. */ }
+  };
+
   useEffect(() => {
     mounted.current = true;
     let stopped = false;
-    const refresh = () => api('/api/snapshot').then((next) => { if (!stopped) receiveSnapshot(next); }).catch((err) => { if (!stopped) { setError(err.message); setLoading(false); } });
+    const refresh = () => refreshSnapshot().catch((err) => { if (!stopped) { setError(err.message); setLoading(false); } });
     refresh();
     api('/api/projects').then((result) => { if (!stopped) setWorkspaceOptions(result.projects || []); }).catch(() => {});
     const events = new EventSource('/api/events');
@@ -145,11 +202,14 @@ function App() {
     events.addEventListener('snapshot', (event) => {
       try { receiveSnapshot(JSON.parse(event.data)); setConnected(true); } catch { setError('同步数据无法读取，正在重试。'); }
     });
-    const interval = setInterval(() => { if (document.visibilityState === 'visible' && Date.now() - lastSnapshot.current > 15_000) refresh(); }, 10_000);
+    const interval = setInterval(() => { if (document.visibilityState === 'visible') { setClockMinute(Math.floor(Date.now() / 60_000)); if (Date.now() - lastSnapshot.current > 15_000) refresh(); } }, 10_000);
     return () => { stopped = true; mounted.current = false; events.close(); clearInterval(interval); clearTimeout(toastTimer.current); };
-  }, [receiveSnapshot]);
+  }, [receiveSnapshot, refreshSnapshot]);
 
-  const threads = useMemo(() => [...snapshot.threads].filter((thread) => !thread.archived).sort((a, b) => b.updatedAt - a.updatedAt), [snapshot.threads]);
+  const threads = useMemo(() => snapshot.threads.filter((thread) => !thread.archived).map((thread) => {
+    if (connected || !['active', 'waiting'].includes(thread.status)) return thread;
+    return { ...thread, status: 'unknown', activity: { ...thread.activity, status: 'unknown', stale: true, reason: '同步连接已断开，当前运行状态无法确认。' } };
+  }).sort((a, b) => b.updatedAt - a.updatedAt), [snapshot.threads, connected]);
   const organization = snapshot.organization || emptyOrganization;
   const folders = useMemo(() => {
     const map = new Map();
@@ -183,8 +243,9 @@ function App() {
     const byId = new Map(visibleThreads.map((thread) => [thread.id, thread]));
     const children = new Map();
     visibleThreads.forEach((thread) => {
-      if (!children.has(thread.forkedFromId)) children.set(thread.forkedFromId, []);
-      children.get(thread.forkedFromId).push(thread);
+      const parent = parentOf(thread);
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(thread);
     });
     const placed = new Set();
     const ordered = [];
@@ -196,8 +257,8 @@ function App() {
     visibleThreads.forEach((thread) => {
       let ancestor = thread;
       const checked = new Set([thread.id]);
-      while (byId.has(ancestor.forkedFromId) && !checked.has(ancestor.forkedFromId)) {
-        ancestor = byId.get(ancestor.forkedFromId); checked.add(ancestor.id);
+      while (byId.has(parentOf(ancestor)) && !checked.has(parentOf(ancestor))) {
+        ancestor = byId.get(parentOf(ancestor)); checked.add(ancestor.id);
       }
       visit(ancestor);
     });
@@ -209,11 +270,13 @@ function App() {
   const selectedProjectName = selectedProject === 'unassigned' ? '未归类' : projects.find((project) => project.id === selectedProject)?.name || '全部对话';
   const selectedManualEdge = snapshot.graph.edges.find((edge) => edge.id === selectedEdgeId);
   const selectedFork = selectedEdgeId?.startsWith('fork:') ? threads.find((thread) => `fork:${thread.id}` === selectedEdgeId) : null;
+  const selectedInherited = selectedEdgeId?.startsWith('inherit:') ? threads.find((thread) => `inherit:${thread.id}` === selectedEdgeId) : null;
 
   const updateOrganization = useCallback(async (patch) => {
     setOrganizationSaving(true);
     try {
       const result = await api('/api/organization', { method: 'PATCH', body: JSON.stringify(patch) });
+      snapshotGeneration.current++;
       setSnapshot((current) => ({ ...current, organization: result.organization }));
       return result.organization;
     } finally { setOrganizationSaving(false); }
@@ -289,13 +352,14 @@ function App() {
     finally { clearTimeout(timeout); opening.current = false; setOpeningThreadId(null); }
   }, [launchThread, notify]);
   const forkThread = useCallback((thread) => setModal({ kind: 'fork', thread, cwd: thread.cwd, title: `${titleOf(thread).slice(0, 112)} · Fork`, ...organization.assignments[thread.id] }), [organization.assignments]);
+  const inheritThread = useCallback((thread) => setModal({ kind: 'inherit', thread, cwd: thread.cwd, title: `${titleOf(thread).slice(0, 112)} · 续聊`, ...organization.assignments[thread.id] }), [organization.assignments]);
 
   useEffect(() => {
     setNodes((current) => {
       const existing = new Map(current.map((node) => [node.id, node]));
       const assigned = new Map();
       layoutThreads.forEach((thread) => {
-        const position = positions.current[thread.id] || snapshot.graph.positions[thread.id] || existing.get(thread.id)?.position;
+        const position = positions.current[thread.id] || snapshot.graph.positions[thread.id] || layoutPositions.current.get(thread.id) || existing.get(thread.id)?.position;
         if (position) assigned.set(thread.id, position);
       });
       return layoutThreads.map((thread, index) => {
@@ -309,17 +373,15 @@ function App() {
           } while ([...assigned.values()].some((used) => Math.abs(used.x - position.x) < 310 && Math.abs(used.y - position.y) < 195));
           assigned.set(thread.id, position);
         }
-        return {
-          ...old,
-          id: thread.id,
-          type: 'session',
-          position,
-          selected: thread.id === selectedThreadId,
-          data: { thread, onCopy: copyId, onOpen: openThread, onFork: forkThread, canFork: snapshot.capabilities.fork !== false, canOpen: snapshot.capabilities.openVscode !== false && !openingThreadId, opening: openingThreadId === thread.id, project: organization.projects.find((project) => project.id === organization.assignments[thread.id]?.projectId), task: organization.tasks.find((task) => task.id === organization.assignments[thread.id]?.taskId) },
-        };
+        layoutPositions.current.set(thread.id, position);
+        const selected = thread.id === selectedThreadId;
+        const data = { thread, onCopy: copyId, onOpen: openThread, onFork: forkThread, onInherit: inheritThread, canInherit: snapshot.capabilities.inherit !== false && snapshot.capabilities.create !== false && !openingThreadId, canFork: snapshot.capabilities.fork !== false, canOpen: snapshot.capabilities.openVscode !== false && !openingThreadId, opening: openingThreadId === thread.id, project: organization.projects.find((project) => project.id === organization.assignments[thread.id]?.projectId), task: organization.tasks.find((task) => task.id === organization.assignments[thread.id]?.taskId), timeLabel: relativeTime(thread.updatedAt) };
+        const sameData = old && Object.keys(data).every((key) => old.data[key] === data[key]);
+        if (sameData && old.selected === selected && old.position.x === position.x && old.position.y === position.y) return old;
+        return { ...old, id: thread.id, type: 'session', position, selected, data: sameData ? old.data : data };
       });
     });
-  }, [layoutThreads, snapshot.graph.positions, snapshot.capabilities, selectedThreadId, copyId, openThread, forkThread, organization, openingThreadId]);
+  }, [layoutThreads, snapshot.graph.positions, snapshot.capabilities, selectedThreadId, copyId, openThread, forkThread, inheritThread, organization, openingThreadId, clockMinute]);
 
   useEffect(() => {
     fitTimer.current = setTimeout(() => {
@@ -353,19 +415,72 @@ function App() {
       labelStyle: { fill: '#887c9d', fontSize: 11 }, labelBgStyle: { fill: '#f7f8f5' }, labelBgPadding: [6, 3], labelBgBorderRadius: 4,
       interactionWidth: 20,
     }));
-    return [...forks, ...manual];
+    const inherited = visibleThreads.filter((thread) => thread.inheritedFromId && ids.has(thread.inheritedFromId)).map((thread) => ({
+      id: `inherit:${thread.id}`, source: thread.inheritedFromId, target: thread.id, type: 'routed', label: '继承', data: { cards },
+      deletable: false, selected: selectedEdgeId === `inherit:${thread.id}`,
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#609293', width: 14, height: 14 },
+      style: { stroke: '#609293', strokeWidth: selectedEdgeId === `inherit:${thread.id}` ? 2 : 1.5, strokeDasharray: '7 3' },
+      labelStyle: { fill: '#4f7d7e', fontSize: 11 }, labelBgStyle: { fill: '#f7f8f5' }, labelBgPadding: [6, 3], labelBgBorderRadius: 4,
+      interactionWidth: 20,
+    }));
+    return [...forks, ...inherited, ...manual];
   }, [snapshot.graph.edges, visibleThreads, selectedEdgeId, nodes]);
 
+  const startDrag = useCallback((_event, node) => {
+    clearTimeout(fitTimer.current);
+    snapshotGeneration.current++;
+    positionRevisions.current.set(node.id, (positionRevisions.current.get(node.id) || 0) + 1);
+    if (!positionFallbacks.current.has(node.id)) positionFallbacks.current.set(node.id, layoutPositions.current.get(node.id) || node.position);
+    setSelectedThreadId(node.id);
+    setSelectedEdgeId(null);
+    dragging.current.add(node.id);
+    positions.current[node.id] = node.position;
+  }, []);
+  const savePosition = useCallback(async (_event, node) => {
+    const { id, position } = node;
+    const revision = positionRevisions.current.get(id);
+    dragging.current.delete(id);
+    positions.current[id] = position;
+    graph.current = { ...graph.current, positions: { ...graph.current.positions, [id]: position } };
+    const settle = (saved) => {
+      if (positionRevisions.current.get(id) !== revision || dragging.current.has(id)) return;
+      delete positions.current[id];
+      layoutPositions.current.set(id, saved);
+      graph.current = { ...graph.current, positions: { ...graph.current.positions, [id]: saved } };
+      setSnapshot((current) => ({ ...current, graph: { ...current.graph, positions: { ...current.graph.positions, [id]: saved } } }));
+    };
+    try {
+      const result = await persist({ positions: { [id]: position } });
+      snapshotGeneration.current++;
+      const saved = result.graph.positions[id];
+      confirmedGraph.current = { ...confirmedGraph.current, positions: { ...confirmedGraph.current.positions, [id]: saved } };
+      settle(saved);
+    } catch {
+      settle(confirmedGraph.current.positions[id] || positionFallbacks.current.get(id));
+    }
+  }, [persist]);
+
   const saveEdges = useCallback(async (edges) => {
-    const before = graph.current.edges;
+    const revision = ++edgeRevision.current;
+    snapshotGeneration.current++;
     localEdges.current = edges;
     graph.current = { ...graph.current, edges };
     setSnapshot((current) => ({ ...current, graph: { ...current.graph, edges } }));
-    try { await persist({ edges }); }
-    catch {
+    try {
+      const result = await persist({ edges });
+      snapshotGeneration.current++;
+      confirmedGraph.current = { ...confirmedGraph.current, edges: result.graph.edges };
+      if (edgeRevision.current === revision) {
+        localEdges.current = null;
+        graph.current = { ...graph.current, edges: result.graph.edges };
+        setSnapshot((current) => ({ ...current, graph: { ...current.graph, edges: result.graph.edges } }));
+      }
+    } catch {
+      if (edgeRevision.current !== revision) return;
       localEdges.current = null;
-      graph.current = { ...graph.current, edges: before };
-      setSnapshot((current) => ({ ...current, graph: { ...current.graph, edges: before } }));
+      const savedEdges = confirmedGraph.current.edges;
+      graph.current = { ...graph.current, edges: savedEdges };
+      setSnapshot((current) => ({ ...current, graph: { ...current.graph, edges: savedEdges } }));
     }
   }, [persist]);
   const onConnect = useCallback(({ source, target }) => {
@@ -382,8 +497,10 @@ function App() {
     setTimeout(() => flow.current?.fitView({ nodes: [{ id: thread.id }], padding: 1.5, maxZoom: 1.05, duration: 250 }), 30);
   }, []);
   const openNew = () => setModal({ kind: 'new', cwd: folder || visibleThreads[0]?.cwd || projectThreads[0]?.cwd || workspaceOptions[0]?.cwd || '', title: '', projectId: selectedProject === 'unassigned' ? null : selectedProject || null, taskId: selectedTask === 'unassigned' ? null : selectedTask || null });
-  const onCreated = async (thread, assignment) => {
+  const onCreated = async (thread, assignment, kind) => {
     setModal(null);
+    snapshotGeneration.current++;
+    setSnapshot((current) => ({ ...current, threads: [thread, ...current.threads.filter((item) => item.id !== thread.id)], organization: { ...current.organization, assignments: { ...current.organization.assignments, [thread.id]: assignment } } }));
     setBranch('');
     setSearch('');
     setSelectedProject(assignment?.projectId || '');
@@ -391,9 +508,10 @@ function App() {
     setFolder('');
     setSelectedThreadId(thread.id);
     setSelectedEdgeId(null);
-    notify('对话已创建，可打开 VS Code 继续。');
-    try { receiveSnapshot(await api('/api/snapshot')); } catch (err) { notify(err.message, 'error'); }
+    notify(kind === 'inherit' ? '交接上下文已载入，正在打开 VS Code。' : '对话已创建，可打开 VS Code 继续。');
+    try { await refreshSnapshot(); } catch (err) { notify(err.message, 'error'); }
     setTimeout(() => flow.current?.fitView({ nodes: [{ id: thread.id }], padding: 1.5, maxZoom: 1, duration: 200 }), 250);
+    if (kind === 'inherit') await openThread(thread);
   };
 
   return (
@@ -411,9 +529,10 @@ function App() {
         <div className="sidebar-section-label thread-list-label">对话 <span>{visibleThreads.length}</span></div>
         <label className="search-box"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索标题 / ID" aria-label="搜索标题或 ID" data-testid="thread-search" />{search && <button onClick={() => setSearch('')} aria-label="清空搜索"><X size={12} /></button>}</label>
         <div className="thread-list" data-testid="thread-list">
-          {visibleThreads.map((thread) => <button className={`thread-list-item ${thread.id === selectedThreadId ? 'selected' : ''}`} key={thread.id} title={`${titleOf(thread)}\n${thread.id}`} onClick={() => focusThread(thread)} data-testid={`thread-list-${thread.id}`}><span className={`list-thread-dot ${thread.status === 'active' ? 'active' : ''}`} /><span className="list-thread-text"><strong>{titleOf(thread)}</strong><small>{relativeTime(thread.updatedAt)}</small></span></button>)}
+          {visibleThreads.map((thread) => <button className={`thread-list-item ${thread.id === selectedThreadId ? 'selected' : ''}`} data-status={activityPresentation(thread).status} key={thread.id} title={`${titleOf(thread)}\n${activityPresentation(thread).label}\n${thread.id}`} onClick={() => focusThread(thread)} data-testid={`thread-list-${thread.id}`}><span className={`list-thread-dot ${activityPresentation(thread).status}`} aria-hidden="true" /><span className="list-thread-text"><strong>{titleOf(thread)}</strong><small><span className="list-thread-status">{activityPresentation(thread).label}</span> · {relativeTime(thread.updatedAt)}</small></span></button>)}
           {!loading && !visibleThreads.length && <p className="sidebar-empty">{search ? '没有匹配的对话' : '暂无对话'}</p>}
         </div>
+        <button className="activity-toggle" aria-pressed={activityNotifications} title="需你处理或本轮结束时显示页内提示" onClick={toggleActivityNotifications} data-testid="activity-notifications-toggle">{activityNotifications ? <Bell size={13} /> : <BellOff size={13} />}<span>状态提示</span><strong>{activityNotifications ? '开启' : '关闭'}</strong></button>
         <div className="sidebar-footer"><span className={`sync-indicator ${connected ? 'connected' : ''}`} /><span data-testid="sync-status">{loading ? '正在读取…' : connected ? '本机同步已连接' : '同步连接已断开，重试中'}</span>{(saving || organizationSaving) && <LoaderCircle size={12} className="spin" aria-label="正在保存" />}</div>
       </aside>
 
@@ -422,9 +541,9 @@ function App() {
           <div className="workspace-heading"><span className="eyebrow">{selectedTask && selectedTask !== 'unassigned' ? tasks.find((task) => task.id === selectedTask)?.name : '对话地图'}</span><h1>{selectedProjectName}<span>{visibleThreads.length}</span></h1></div>
           <div className="toolbar"><label className="branch-select folder-select" title={folder || '按文件夹筛选'}><FolderOpen size={14} /><select aria-label="筛选文件夹" data-testid="folder-filter" value={folder} onChange={(event) => { setFolder(event.target.value); setBranch(''); setSelectedThreadId(null); setSelectedEdgeId(null); }}><option value="">全部文件夹</option>{folders.map((item) => <option key={item.key} value={item.key}>{shortPath(item.key)}</option>)}</select><ChevronDown size={12} /></label><label className="branch-select"><GitBranch size={14} /><select aria-label="筛选 Git 分支" data-testid="branch-filter" value={branch} onChange={(event) => { setBranch(event.target.value); setSelectedThreadId(null); setSelectedEdgeId(null); }}><option value="">全部分支</option>{branches.map((name) => <option key={name} value={name}>{name}</option>)}</select><ChevronDown size={12} /></label><span className="toolbar-divider" /><label className="relation-select"><Link2 size={14} /><span>连线</span><select aria-label="新连线关系" data-testid="relation-type" value={relationType} onChange={(event) => setRelationType(event.target.value)}>{Object.entries(RELATIONS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label></div>
         </header>
-        {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={async () => { try { receiveSnapshot(await api('/api/snapshot')); } catch (err) { setError(err.message); } }}>重试</button></div>}
+        {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={async () => { try { await refreshSnapshot(); } catch (err) { setError(err.message); } }}>重试</button></div>}
         <div className="canvas-area">
-          <ReactFlow nodes={nodes} edges={flowEdges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} onInit={(instance) => { flow.current = instance; }} onNodesChange={(changes) => setNodes((current) => applyNodeChanges(changes, current))} onNodeDragStart={(_event, node) => { clearTimeout(fitTimer.current); dragging.current.add(node.id); positions.current[node.id] = node.position; }} onNodeDrag={(_event, node) => { positions.current[node.id] = node.position; }} onNodeDragStop={(_event, node) => { dragging.current.delete(node.id); positions.current[node.id] = node.position; graph.current.positions[node.id] = node.position; persist({ positions: { [node.id]: node.position } }).catch(() => {}); }} onNodeClick={(_event, node) => { setSelectedThreadId(node.id); setSelectedEdgeId(null); }} onEdgeClick={(_event, edge) => { setSelectedEdgeId(edge.id); setSelectedThreadId(null); }} onPaneClick={() => { setSelectedThreadId(null); setSelectedEdgeId(null); }} onConnect={onConnect} onConnectStart={() => clearTimeout(fitTimer.current)} connectionMode={ConnectionMode.Loose} isValidConnection={(connection) => connection.source !== connection.target} minZoom={0.2} maxZoom={1.8} deleteKeyCode={null} fitView fitViewOptions={{ padding: 0.18, minZoom: 0.6, maxZoom: 1 }} onlyRenderVisibleElements proOptions={{ hideAttribution: true }} aria-label="对话关系画布">
+          <ReactFlow nodes={nodes} edges={flowEdges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} onInit={(instance) => { flow.current = instance; }} onNodesChange={(changes) => setNodes((current) => applyNodeChanges(changes, current))} onNodeDragStart={startDrag} onNodeDrag={(_event, node) => { positions.current[node.id] = node.position; }} onNodeDragStop={savePosition} onNodeClick={(_event, node) => { setSelectedThreadId(node.id); setSelectedEdgeId(null); }} onEdgeClick={(_event, edge) => { setSelectedEdgeId(edge.id); setSelectedThreadId(null); }} onPaneClick={() => { setSelectedThreadId(null); setSelectedEdgeId(null); }} onConnect={onConnect} onConnectStart={() => clearTimeout(fitTimer.current)} connectionMode={ConnectionMode.Loose} isValidConnection={(connection) => connection.source !== connection.target} minZoom={0.2} maxZoom={1.8} deleteKeyCode={null} fitView fitViewOptions={{ padding: 0.18, minZoom: 0.6, maxZoom: 1 }} onlyRenderVisibleElements proOptions={{ hideAttribution: true }} aria-label="对话关系画布">
             <Background color="#dce2d9" gap={22} size={1} />
             <Controls showInteractive={false} position="bottom-left" />
           </ReactFlow>
@@ -435,20 +554,132 @@ function App() {
           {selectedThread && <aside className="detail-panel" data-testid="thread-detail">
             <div className="detail-heading"><span>对话详情</span><button className="icon-button" aria-label="关闭详情" onClick={() => setSelectedThreadId(null)}><X size={16} /></button></div>
             <h2>{titleOf(selectedThread)}</h2>
+            <div className="detail-activity" data-status={activityPresentation(selectedThread).status}><ActivityBadge thread={selectedThread} /><p>{activityPresentation(selectedThread).reason}</p>{selectedThread.activity?.at && <small>状态记录于 {new Date(selectedThread.activity.at).toLocaleString('zh-CN')}</small>}</div>
             <p className="detail-preview">{selectedThread.preview || '暂无内容预览'}</p>
+            <RecentReplies key={selectedThread.id} thread={selectedThread} />
+            {selectedThread.inheritedFromId && <InheritedPrompt key={`inherited:${selectedThread.id}`} threadId={selectedThread.id} notify={notify} />}
             <div className="assignment-fields"><div className="assignment-label"><label htmlFor="assign-project">项目</label><button className="icon-button" aria-label="编辑项目和任务" title="编辑项目和任务" onClick={() => setOrganizationModal({ projectId: selectedAssignment.projectId })}><Pencil size={12} /></button></div><select id="assign-project" className="form-input" data-testid="assign-project" value={selectedAssignment.projectId || ''} disabled={organizationSaving} onChange={(event) => assignThread(event.target.value)}><option value="">未归类</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><div className="assignment-label"><label htmlFor="assign-task">任务</label>{selectedAssignment.projectId && <button className="icon-button" aria-label="添加项目任务" title="添加项目任务" onClick={() => setOrganizationModal({ projectId: selectedAssignment.projectId, action: 'createTask' })}><Plus size={12} /></button>}</div><select id="assign-task" className="form-input" data-testid="assign-task" value={selectedAssignment.taskId || ''} disabled={organizationSaving || !selectedAssignment.projectId} onChange={(event) => assignThread(selectedAssignment.projectId, event.target.value)}><option value="">未指定任务</option>{organization.tasks.filter((task) => task.projectId === selectedAssignment.projectId).map((task) => <option key={task.id} value={task.id}>{task.name}</option>)}</select></div>
-            <dl><dt>对话 ID <button className="icon-button" aria-label="复制详情中的对话 ID" data-testid="detail-copy" onClick={() => copyId(selectedThread.id)}><Copy size={12} /></button></dt><dd className="thread-id" data-testid="detail-thread-id">{selectedThread.id}</dd><dt>文件夹</dt><dd>{shortPath(selectedThread.cwd) || '未知'}</dd><dt>Git 分支</dt><dd>{selectedThread.branch || '分支未知'}</dd><dt>最近活动</dt><dd>{selectedThread.updatedAt ? new Date(Number(selectedThread.updatedAt)).toLocaleString('zh-CN') : '未知'}</dd>{selectedThread.forkedFromId && <><dt>Fork 来源</dt><dd className="thread-id">{selectedThread.forkedFromId}</dd></>}</dl>
-            <button className="primary-button full-width" onClick={() => openThread(selectedThread)} disabled={snapshot.capabilities.openVscode === false || !!openingThreadId} data-testid="detail-open">{openingThreadId === selectedThread.id ? <LoaderCircle size={15} className="spin" /> : <ArrowUpRight size={15} />}{openingThreadId === selectedThread.id ? '正在定位…' : '在 VS Code 打开'}</button><button className="change-window" onClick={() => openThread(selectedThread, true)} disabled={snapshot.capabilities.openVscode === false || !!openingThreadId} data-testid="change-window">选择其他 VS Code 窗口</button><button className="secondary-button full-width" onClick={() => forkThread(selectedThread)} disabled={snapshot.capabilities.fork === false} data-testid="detail-fork"><GitFork size={14} /> 从此对话 Fork</button>
+            <dl><dt>对话 ID <button className="icon-button" aria-label="复制详情中的对话 ID" data-testid="detail-copy" onClick={() => copyId(selectedThread.id)}><Copy size={12} /></button></dt><dd className="thread-id" data-testid="detail-thread-id">{selectedThread.id}</dd><dt>文件夹</dt><dd>{shortPath(selectedThread.cwd) || '未知'}</dd><dt>Git 分支</dt><dd>{selectedThread.branch || '分支未知'}</dd><dt>最近活动</dt><dd>{selectedThread.updatedAt ? new Date(Number(selectedThread.updatedAt)).toLocaleString('zh-CN') : '未知'}</dd>{selectedThread.inheritedFromId && <><dt>继承来源</dt><dd className="thread-id" data-testid="detail-inherited-from">{selectedThread.inheritedFromId}</dd></>}{selectedThread.forkedFromId && <><dt>Fork 来源</dt><dd className="thread-id">{selectedThread.forkedFromId}</dd></>}</dl>
+            <button className="primary-button full-width" onClick={() => openThread(selectedThread)} disabled={snapshot.capabilities.openVscode === false || !!openingThreadId} data-testid="detail-open">{openingThreadId === selectedThread.id ? <LoaderCircle size={15} className="spin" /> : <ArrowUpRight size={15} />}{openingThreadId === selectedThread.id ? '正在定位…' : '在 VS Code 打开'}</button><button className="change-window" onClick={() => openThread(selectedThread, true)} disabled={snapshot.capabilities.openVscode === false || !!openingThreadId} data-testid="change-window">选择其他 VS Code 窗口</button><button className="secondary-button full-width inherit-detail-button" onClick={() => inheritThread(selectedThread)} disabled={snapshot.capabilities.inherit === false || snapshot.capabilities.create === false || !!openingThreadId} data-testid="detail-inherit"><ArrowRightToLine size={14} />继承为新对话</button><button className="secondary-button full-width" onClick={() => forkThread(selectedThread)} disabled={snapshot.capabilities.fork === false} data-testid="detail-fork"><GitFork size={14} /> 从此对话 Fork</button>
           </aside>}
-          {(selectedManualEdge || selectedFork) && <aside className="detail-panel relation-panel" data-testid="edge-detail"><div className="detail-heading"><span>{selectedFork ? 'Fork 关系' : '编辑关系'}</span><button className="icon-button" aria-label="关闭关系详情" onClick={() => setSelectedEdgeId(null)}><X size={16} /></button></div><div className="edge-endpoints"><span>{titleOf(threads.find((thread) => thread.id === (selectedManualEdge?.source || selectedFork?.forkedFromId)))}</span><span className="edge-direction">↓</span><span>{titleOf(threads.find((thread) => thread.id === (selectedManualEdge?.target || selectedFork?.id)))}</span></div>{selectedManualEdge ? <><label className="field-label" htmlFor="edge-kind">关系类型</label><select id="edge-kind" className="form-input" value={selectedManualEdge.type} data-testid="edge-type" onChange={(event) => saveEdges(graph.current.edges.map((edge) => edge.id === selectedManualEdge.id ? { ...edge, type: event.target.value } : edge))}>{Object.entries(RELATIONS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><p className="field-note">用于标记对话关系，不会自动传递上下文或执行任务。</p><button className="danger-button full-width" data-testid="delete-edge" onClick={() => { saveEdges(graph.current.edges.filter((edge) => edge.id !== selectedManualEdge.id)); setSelectedEdgeId(null); }}><Trash2 size={13} /> 删除连线</button></> : <p className="field-note">这条关系来自 Codex 的真实 Fork 记录，自动同步。</p>}</aside>}
+          {activityNotices.length > 0 && <section className="activity-notices" aria-label="状态提示" aria-live="polite" data-testid="activity-notices">{activityNotices.map((notice) => <div className={`activity-notice ${notice.status}`} data-status={notice.status} key={notice.id}><button className="activity-notice-open" onClick={() => { const thread = threads.find((item) => item.id === notice.threadId); if (thread) focusThread(thread); setActivityNotices((current) => current.filter((item) => item.id !== notice.id)); }}>{notice.status === 'waiting' ? <Bell size={15} /> : <Check size={15} />}<span><strong>{activityPresentation(notice).label}</strong><span>{notice.title}</span></span></button><button className="icon-button" aria-label="关闭状态提示" onClick={() => setActivityNotices((current) => current.filter((item) => item.id !== notice.id))}><X size={14} /></button></div>)}</section>}
+          {(selectedManualEdge || selectedFork || selectedInherited) && <aside className="detail-panel relation-panel" data-testid="edge-detail"><div className="detail-heading"><span>{selectedInherited ? '继承关系' : selectedFork ? 'Fork 关系' : '编辑关系'}</span><button className="icon-button" aria-label="关闭关系详情" onClick={() => setSelectedEdgeId(null)}><X size={16} /></button></div><div className="edge-endpoints"><span>{titleOf(threads.find((thread) => thread.id === (selectedManualEdge?.source || selectedInherited?.inheritedFromId || selectedFork?.forkedFromId)))}</span><span className="edge-direction">↓</span><span>{titleOf(threads.find((thread) => thread.id === (selectedManualEdge?.target || selectedInherited?.id || selectedFork?.id)))}</span></div>{selectedManualEdge ? <><label className="field-label" htmlFor="edge-kind">关系类型</label><select id="edge-kind" className="form-input" value={selectedManualEdge.type} data-testid="edge-type" onChange={(event) => saveEdges(graph.current.edges.map((edge) => edge.id === selectedManualEdge.id ? { ...edge, type: event.target.value } : edge))}>{Object.entries(RELATIONS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><p className="field-note">用于标记对话关系，不会自动传递上下文或执行任务。</p><button className="danger-button full-width" data-testid="delete-edge" onClick={() => { saveEdges(graph.current.edges.filter((edge) => edge.id !== selectedManualEdge.id)); setSelectedEdgeId(null); }}><Trash2 size={13} /> 删除连线</button></> : selectedInherited ? <><p className="field-note">这条新对话由来源对话的交接提示词创建，继承关系自动保留。</p><dl><dt>来源对话 ID</dt><dd className="thread-id" data-testid="inherit-source-id">{selectedInherited.inheritedFromId}</dd></dl><button className="secondary-button full-width" data-testid="inherit-view-source" onClick={() => { const source = threads.find((thread) => thread.id === selectedInherited.inheritedFromId); if (source) focusThread(source); }}><ArrowUpRight size={13} />查看来源对话</button></> : <p className="field-note">这条关系来自 Codex 的真实 Fork 记录，自动同步。</p>}</aside>}
         </div>
       </main>
-      {modal && <ThreadModal modal={modal} folders={workspaceOptions.length ? workspaceOptions : folders} organization={organization} onClose={() => setModal(null)} onCreated={onCreated} />}
+      {modal && <ThreadModal key={`${modal.kind}:${modal.thread?.id || 'new'}`} modal={modal} folders={workspaceOptions.length ? workspaceOptions : folders} organization={organization} onClose={() => setModal(null)} onCreated={onCreated} />}
       {organizationModal && <OrganizationModal initial={organizationModal} organization={organization} onClose={() => setOrganizationModal(null)} onSave={updateOrganization} />}
       {windowPicker && <WindowPicker picker={windowPicker} onClose={() => setWindowPicker(null)} onOpen={launchThread} />}
       {toast && <div className={`toast ${toast.kind}`} role="status" data-testid="toast">{toast.kind === 'success' ? <Check size={15} /> : <X size={15} />}{toast.message}</div>}
     </div>
   );
+}
+
+function InheritedSettings({ settings, title = '沿用来源配置', testId = 'inherit-settings' }) {
+  const config = settings && typeof settings === 'object' && !Array.isArray(settings) ? settings : {};
+  const effortLabels = { none: '无', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最高', ultra: '极高', default: '默认' };
+  const tierLabels = { default: '默认', standard: '标准', priority: '优先', fast: '快速', flex: '弹性' };
+  const fields = [
+    ['model', '模型', (value) => value],
+    ['modelProvider', '提供方', (value) => value],
+    ['reasoningEffort', '推理强度', (value) => value === null ? '默认' : effortLabels[value] || value],
+    ['collaborationMode', '协作模式', (value) => value === 'plan' ? '计划模式' : value === 'default' ? '默认模式' : value],
+    ['serviceTier', '服务等级', (value) => value === null ? '默认' : tierLabels[value] || value],
+  ];
+  const rows = fields.filter(([key]) => Object.hasOwn(config, key) && (typeof config[key] === 'string' && config[key].trim() || ['reasoningEffort', 'serviceTier'].includes(key) && config[key] === null));
+  const missing = ['model', 'reasoningEffort', 'collaborationMode', 'serviceTier'].some((key) => !rows.some(([field]) => field === key));
+  return <section className="inherit-settings" data-testid={testId} aria-label={title}>
+    <h3>{title}</h3>
+    {rows.length > 0 && <dl className="inherit-settings-grid">{rows.map(([key, label, format]) => <div key={key}><dt>{label}</dt><dd data-testid={`${testId}-${key}`}>{format(config[key])}</dd></div>)}</dl>}
+    {!rows.length ? <p>来源未记录此设置，使用 Codex 默认值。</p> : missing && <p>来源未记录的设置使用 Codex 默认值。</p>}
+    {config.collaborationMode === 'plan' && <p className="inherit-settings-plan-note" data-testid={`${testId}-plan-note`}>已保存计划模式；打开 VS Code 后请核对计划开关。</p>}
+  </section>;
+}
+
+function InheritedPrompt({ threadId, notify }) {
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState(null);
+  const request = useRef(null);
+  useEffect(() => () => { request.current?.abort(); request.current = null; }, []);
+  const load = async () => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
+    setExpanded(true); setLoading(true); setError('');
+    try {
+      const data = await api(`/api/threads/${encodeURIComponent(threadId)}/inheritance`, { signal: controller.signal });
+      if (request.current === controller && !controller.signal.aborted) setResult({ source: data.source, prompt: typeof data.prompt === 'string' ? data.prompt : '', settings: data.settings });
+    } catch (err) {
+      if (request.current === controller && (!controller.signal.aborted || timedOut)) setError(timedOut ? '读取超时，请重试。' : err.message);
+    } finally {
+      clearTimeout(timeout);
+      if (request.current === controller && (!controller.signal.aborted || timedOut)) setLoading(false);
+    }
+  };
+  const collapse = () => { request.current?.abort(); request.current = null; setExpanded(false); setLoading(false); setError(''); };
+  const copyPrompt = async () => {
+    try { await navigator.clipboard.writeText(result.prompt); notify('已复制交接提示词'); }
+    catch { notify('复制失败，可选中下方提示词手动复制。', 'error'); }
+  };
+  return <section className="inheritance-context" data-testid="inheritance-context">
+    <p className="handoff-note">交接上下文已载入，打开后发送下一条消息即可继续。</p>
+    {!expanded ? <button className="secondary-button full-width" onClick={load} aria-expanded="false" data-testid="show-inheritance"><ArrowRightToLine size={14} />查看交接提示词</button> : <>
+      <div className="replies-heading"><strong>交接提示词</strong><button className="icon-button" title="复制交接提示词" aria-label="复制交接提示词" onClick={copyPrompt} disabled={loading || !result?.prompt} data-testid="inheritance-copy"><Copy size={13} /></button><button className="replies-collapse" onClick={collapse} data-testid="collapse-inheritance">收起</button></div>
+      {loading && <p className="handoff-loading" role="status"><LoaderCircle size={13} className="spin" />正在读取交接提示词…</p>}
+      {error && <div className="form-error" role="alert">{error}<button className="handoff-retry" onClick={load} data-testid="inheritance-retry">重试</button></div>}
+      {result && <><p className="handoff-note">来源：{result.source?.title || '原对话'}</p><InheritedSettings settings={result.settings} title="已继承配置" testId="inheritance-settings" /><pre className="inheritance-prompt" data-testid="inheritance-prompt">{result.prompt || '暂无可显示的交接提示词。'}</pre></>}
+    </>}
+  </section>;
+}
+
+function RecentReplies({ thread }) {
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState(null);
+  const [loadedActivityKey, setLoadedActivityKey] = useState(null);
+  const request = useRef(null);
+  useEffect(() => () => { request.current?.abort(); request.current = null; }, []);
+
+  const loadReplies = async () => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    const activityKey = `${thread.activity?.eventKey || ''}:${thread.activity?.at || ''}`;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
+    setExpanded(true); setLoading(true); setError('');
+    try {
+      const data = await api(`/api/threads/${encodeURIComponent(thread.id)}/replies`, { signal: controller.signal });
+      if (request.current === controller && !controller.signal.aborted) {
+        setResult({ replies: Array.isArray(data.replies) ? data.replies : [], limited: !!data.limited });
+        setLoadedActivityKey(activityKey);
+      }
+    } catch (err) {
+      if (request.current === controller && (!controller.signal.aborted || timedOut)) setError(timedOut ? '读取超时，请重试。' : err.message);
+    } finally {
+      clearTimeout(timeout);
+      if (request.current === controller && (!controller.signal.aborted || timedOut)) setLoading(false);
+    }
+  };
+  const collapse = () => {
+    request.current?.abort(); request.current = null;
+    setExpanded(false); setLoading(false); setError('');
+  };
+  const newerActivity = result && loadedActivityKey !== `${thread.activity?.eventKey || ''}:${thread.activity?.at || ''}`;
+  return <section className="recent-replies" data-testid="recent-replies">
+    {!expanded ? <button className="secondary-button full-width" onClick={loadReplies} data-testid="show-replies"><MessageSquare size={14} />查看最近回复</button> : <>
+      <div className="replies-heading"><strong>最近回复</strong><button className="icon-button" title="刷新回复" aria-label="刷新回复" onClick={loadReplies} disabled={loading} data-testid="refresh-replies"><RefreshCw size={13} className={loading ? 'spin' : ''} /></button><button className="replies-collapse" onClick={collapse} data-testid="collapse-replies">收起</button></div>
+      <p className="replies-note">{newerActivity ? '有新活动，可刷新查看最近回复。' : '按需加载，可能不含完整历史。'}</p>
+      {loading && <p className="replies-loading" role="status"><LoaderCircle size={13} className="spin" />正在读取回复…</p>}
+      {error && <p className="form-error" role="alert">{error}<button className="replies-retry" onClick={loadReplies}>重试</button></p>}
+      {result && <div className="reply-list" data-testid="reply-list">{result.replies.map((reply) => <article className="reply-item" key={reply.id}><div className="reply-meta"><strong>{reply.phase === 'commentary' ? '进展回复' : ['final', 'final_answer'].includes(reply.phase) ? '本轮回复' : '回复'}</strong><time>{reply.at ? new Date(reply.at).toLocaleString('zh-CN') : '时间未知'}</time></div><p>{reply.text}</p>{reply.truncated && <small>此条回复较长，仅显示部分内容。</small>}</article>)}{!result.replies.length && <p className="replies-note">暂未读取到最近回复。</p>}</div>}
+      {result?.limited && <p className="replies-note">仅展示部分最近回复，完整对话请在 VS Code 查看。</p>}
+    </>}
+  </section>;
 }
 
 function WindowPicker({ picker, onClose, onOpen }) {
@@ -510,29 +741,99 @@ function OrganizationModal({ initial, organization, onClose, onSave }) {
 }
 
 function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
+  const isInherit = modal.kind === 'inherit';
   const [title, setTitle] = useState(modal.title);
   const [cwd, setCwd] = useState(modal.cwd);
   const [projectId, setProjectId] = useState(modal.projectId || '');
   const [taskId, setTaskId] = useState(modal.taskId || '');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [prompt, setPrompt] = useState('');
+  const [handoff, setHandoff] = useState({ loading: isInherit, loaded: false, error: '', truncated: false, messageCount: 0 });
+  const handoffRequest = useRef(null);
+  const submitBusy = useRef(false);
+  const creationRequest = useRef(null);
+  const sourceId = modal.thread?.id;
+
+  const loadHandoff = useCallback(async () => {
+    if (!isInherit || !sourceId) return;
+    handoffRequest.current?.abort();
+    const controller = new AbortController();
+    handoffRequest.current = controller;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
+    setHandoff((current) => ({ ...current, loading: true, error: '' }));
+    try {
+      const result = await api(`/api/threads/${encodeURIComponent(sourceId)}/handoff`, { signal: controller.signal });
+      if (handoffRequest.current !== controller || controller.signal.aborted) return;
+      const text = typeof result.prompt === 'string' ? result.prompt : '';
+      setPrompt(text.slice(0, 12000));
+      setHandoff({ loading: false, loaded: true, error: '', truncated: !!result.truncated || text.length > 12000, messageCount: Number(result.messageCount) || 0, settings: result.settings });
+    } catch (err) {
+      if (handoffRequest.current === controller && (!controller.signal.aborted || timedOut)) setHandoff((current) => ({ ...current, loading: false, error: timedOut ? '读取超时，请重试。' : err.message }));
+    } finally { clearTimeout(timeout); }
+  }, [isInherit, sourceId]);
+
   useEffect(() => {
-    const handler = (event) => { if (event.key === 'Escape' && !submitting) onClose(); };
+    loadHandoff();
+    return () => { handoffRequest.current?.abort(); handoffRequest.current = null; };
+  }, [loadHandoff]);
+  useEffect(() => {
+    const handler = (event) => { if (event.key === 'Escape' && !submitBusy.current) onClose(); };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [onClose, submitting]);
+  }, [onClose]);
+
   async function submit(event) {
     event.preventDefault();
+    if (submitBusy.current) return;
     if (!cwd.trim()) { setError('请选择或填写文件夹。'); return; }
+    if (isInherit && (!handoff.loaded || handoff.loading)) { setError('请先读取交接提示词。'); return; }
+    if (isInherit && (!prompt.trim() || prompt.length > 12000)) { setError('交接提示词不能为空，且最多 12000 字符。'); return; }
+    submitBusy.current = true;
     setSubmitting(true); setError('');
+    const assignment = { projectId: projectId || null, taskId: taskId || null };
+    let result;
     try {
-      const url = modal.kind === 'fork' ? `/api/threads/${encodeURIComponent(modal.thread.id)}/fork` : '/api/threads';
-      const assignment = { projectId: projectId || null, taskId: taskId || null };
-      const result = await api(url, { method: 'POST', body: JSON.stringify({ cwd: cwd.trim(), title: title.trim(), ...assignment }) });
-      await onCreated(result.thread, assignment);
-    } catch (err) { setError(err.message); setSubmitting(false); }
+      const url = ['fork', 'inherit'].includes(modal.kind) ? `/api/threads/${encodeURIComponent(sourceId)}/${modal.kind}` : '/api/threads';
+      const payload = { cwd: cwd.trim(), title: title.trim(), ...assignment, ...(isInherit ? { prompt: prompt.trim() } : {}) };
+      const fingerprint = `${url}:${JSON.stringify(payload)}`;
+      if (creationRequest.current?.fingerprint !== fingerprint) creationRequest.current = { fingerprint, requestId: crypto.randomUUID() };
+      result = await api(url, { method: 'POST', body: JSON.stringify({ ...payload, requestId: creationRequest.current.requestId }) });
+      if (!result.thread?.id) throw new Error('创建结果尚未确认，请保持当前内容重试。');
+    } catch (err) {
+      setError(err instanceof TypeError ? '连接中断，创建结果尚未确认。请保持当前内容重试，以恢复本次结果。' : err.message); setSubmitting(false); submitBusy.current = false;
+      return;
+    }
+    // Creation has succeeded. Opening the editor is a separate action, so an
+    // editor failure must never re-enable this POST or create another thread.
+    await onCreated(result.thread, assignment, modal.kind);
   }
-  return <div className="modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget && !submitting) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" data-testid="thread-modal"><div className="modal-heading"><span className="modal-icon">{modal.kind === 'fork' ? <GitFork size={21} /> : <Plus size={21} />}</span><button className="icon-button" onClick={onClose} disabled={submitting} aria-label="关闭窗口"><X size={18} /></button></div><h2 id="modal-title">{modal.kind === 'fork' ? 'Fork 对话' : '新建对话'}</h2><p className="modal-description">{modal.kind === 'fork' ? '沿用这条对话的上下文，并创建新的独立对话。' : '创建后可在 VS Code 中开始对话。'}</p>{modal.kind === 'fork' && <div className="fork-origin"><GitFork size={13} /><span>{titleOf(modal.thread)}</span></div>}<form onSubmit={submit}><label className="field-label" htmlFor="thread-title">对话名称 <span>可选</span></label><input className="form-input" id="thread-title" data-testid="modal-title" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：相机初始化问题" autoFocus maxLength={120} disabled={submitting} /><label className="field-label" htmlFor="thread-cwd">文件夹</label><input className="form-input path-input" id="thread-cwd" data-testid="modal-cwd" list="workspace-paths" value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/home/…/your-project" required disabled={submitting} /><datalist id="workspace-paths">{[...new Set(folders.map((item) => item.cwd).filter(Boolean))].map((path) => <option value={path} key={path} />)}</datalist><div className="modal-assignment"><div><label className="field-label" htmlFor="modal-project">项目</label><select id="modal-project" className="form-input" data-testid="modal-project" value={projectId} disabled={submitting} onChange={(event) => { setProjectId(event.target.value); setTaskId(''); }}><option value="">未归类</option>{organization.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div><div><label className="field-label" htmlFor="modal-task">任务</label><select id="modal-task" className="form-input" data-testid="modal-task" value={taskId} disabled={submitting || !projectId} onChange={(event) => setTaskId(event.target.value)}><option value="">未指定任务</option>{organization.tasks.filter((task) => task.projectId === projectId).map((task) => <option key={task.id} value={task.id}>{task.name}</option>)}</select></div></div>{error && <p className="form-error" role="alert" data-testid="modal-error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={submitting} data-testid="modal-cancel">取消</button><button type="submit" className="primary-button" disabled={submitting} data-testid="modal-submit">{submitting ? <LoaderCircle className="spin" size={14} /> : modal.kind === 'fork' ? <GitFork size={14} /> : <Plus size={14} />}{submitting ? '正在创建…' : modal.kind === 'fork' ? '创建 Fork' : '创建对话'}</button></div></form></section></div>;
+  const blocked = submitting || (isInherit && (!handoff.loaded || handoff.loading || !prompt.trim() || prompt.length > 12000));
+  const actionIcon = modal.kind === 'fork' ? <GitFork size={14} /> : isInherit ? <ArrowRightToLine size={14} /> : <Plus size={14} />;
+  return <div className="modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget && !submitBusy.current) onClose(); }}><section className={`modal ${isInherit ? 'inherit-modal' : ''}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" data-testid="thread-modal">
+    <div className="modal-heading"><span className="modal-icon">{modal.kind === 'fork' ? <GitFork size={21} /> : isInherit ? <ArrowRightToLine size={21} /> : <Plus size={21} />}</span><button className="icon-button" onClick={onClose} disabled={submitting} aria-label="关闭窗口"><X size={18} /></button></div>
+    <h2 id="modal-title">{modal.kind === 'fork' ? 'Fork 对话' : isInherit ? '继承为新对话' : '新建对话'}</h2>
+    <p className="modal-description">{modal.kind === 'fork' ? '沿用这条对话的上下文，并创建新的独立对话。' : isInherit ? '创建独立新对话，沿用已记录的来源配置并带入下方交接提示词，适合长对话继续。创建后会打开 VS Code，发送下一条消息即可继续。' : '创建后可在 VS Code 中开始对话。'}</p>
+    {['fork', 'inherit'].includes(modal.kind) && <div className={`fork-origin ${isInherit ? 'inherit-origin' : ''}`} data-testid={isInherit ? 'inherit-origin' : undefined}>{isInherit ? <ArrowRightToLine size={13} /> : <GitFork size={13} />}<span>{titleOf(modal.thread)}</span></div>}
+    <div className="creation-permissions" data-testid="modal-permissions"><strong>Full Access</strong><span>· 完整文件与命令访问，无需逐项审批</span></div>
+    <form onSubmit={submit}>
+      <label className="field-label" htmlFor="thread-title">对话名称 <span>可选</span></label><input className="form-input" id="thread-title" data-testid="modal-title" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：相机初始化问题" autoFocus maxLength={120} disabled={submitting} />
+      <label className="field-label" htmlFor="thread-cwd">文件夹</label><input className="form-input path-input" id="thread-cwd" data-testid="modal-cwd" list="workspace-paths" value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/home/…/your-project" required disabled={submitting} /><datalist id="workspace-paths">{[...new Set(folders.map((item) => item.cwd).filter(Boolean))].map((path) => <option value={path} key={path} />)}</datalist>
+      <div className="modal-assignment"><div><label className="field-label" htmlFor="modal-project">项目</label><select id="modal-project" className="form-input" data-testid="modal-project" value={projectId} disabled={submitting} onChange={(event) => { setProjectId(event.target.value); setTaskId(''); }}><option value="">未归类</option>{organization.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div><div><label className="field-label" htmlFor="modal-task">任务</label><select id="modal-task" className="form-input" data-testid="modal-task" value={taskId} disabled={submitting || !projectId} onChange={(event) => setTaskId(event.target.value)}><option value="">未指定任务</option>{organization.tasks.filter((task) => task.projectId === projectId).map((task) => <option key={task.id} value={task.id}>{task.name}</option>)}</select></div></div>
+      {isInherit && handoff.loaded && <InheritedSettings settings={handoff.settings} />}
+      {isInherit && <section className="handoff-editor"><div className="handoff-label"><label className="field-label" htmlFor="inherit-prompt">交接提示词</label><span data-testid="inherit-prompt-count">{prompt.length} / 12000</span></div><p className="field-note" id="inherit-prompt-help">下方包含最近公开消息摘录。请补充目标、已有决定和待办，让新对话了解接下来要做什么。</p>
+        {handoff.loading && <p className="handoff-loading" role="status" data-testid="inherit-loading"><LoaderCircle size={14} className="spin" />正在读取交接内容…</p>}
+        {handoff.error && <div className="form-error" role="alert" data-testid="inherit-error">{handoff.error}<button className="handoff-retry" type="button" onClick={loadHandoff} disabled={submitting} data-testid="inherit-retry">重新读取</button></div>}
+        <textarea id="inherit-prompt" className="form-input handoff-textarea" data-testid="inherit-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} disabled={submitting || handoff.loading || !handoff.loaded} maxLength={12000} rows={9} aria-describedby="inherit-prompt-help" placeholder="目标：
+已有决定：
+下一步待办：" />
+        {handoff.loaded && <p className={`handoff-note ${handoff.truncated ? 'is-truncated' : ''}`} data-testid="inherit-note">{handoff.messageCount ? `已读取 ${handoff.messageCount} 条公开消息。` : '暂无可用公开消息，可自行补写交接提示词。'}{handoff.truncated && ' 内容已截取，请补齐需要保留的信息。'}</p>}
+      </section>}
+      {error && <p className="form-error" role="alert" data-testid="modal-error">{error}</p>}
+      <div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={submitting} data-testid="modal-cancel">取消</button><button type="submit" className="primary-button" disabled={blocked} data-testid="modal-submit">{submitting ? <LoaderCircle className="spin" size={14} /> : actionIcon}{submitting ? '正在创建…' : modal.kind === 'fork' ? '创建 Fork' : isInherit ? '继承并打开' : '创建对话'}</button></div>
+    </form>
+  </section></div>;
 }
 
 createRoot(document.getElementById('root')).render(<App />);

@@ -10,6 +10,7 @@ async function setup(t) {
   const calls = [], opened = [];
   const appServer = { async request(method, params) {
     calls.push({ method, params });
+    if (method === 'thread/settings/update') return {};
     if (method === 'thread/unsubscribe') return {};
     if (method === 'thread/name/set') {
       fixture.db.prepare('UPDATE threads SET name=? WHERE id=?').run(params.name, params.threadId);
@@ -61,7 +62,16 @@ test('HTTP：新建和 Fork 使用 metadata API，并复制具体 thread.id', as
   assert.equal(forked.status, 201);
   assert.equal(forked.body.thread.forkedFromId, created.body.thread.id);
   assert.notEqual(forked.body.thread.id, created.body.thread.id);
-  assert.deepEqual(calls.map(x => x.method), ['thread/start', 'thread/name/set', 'thread/unsubscribe', 'thread/fork', 'thread/name/set', 'thread/unsubscribe']);
+  assert.deepEqual(calls.map(x => x.method), ['thread/start', 'thread/name/set', 'thread/settings/update', 'thread/unsubscribe', 'thread/fork', 'thread/name/set', 'thread/settings/update', 'thread/unsubscribe']);
+  for (const { params } of calls.filter(x => x.method === 'thread/start' || x.method === 'thread/fork')) {
+    assert.equal(params.approvalPolicy, 'never');
+    assert.equal(params.permissions, ':danger-full-access');
+    assert.equal(Object.hasOwn(params, 'sandbox'), false);
+  }
+  assert.deepEqual(calls.filter(x => x.method === 'thread/settings/update').map(x => x.params), [
+    { threadId: created.body.thread.id, approvalPolicy: 'never', permissions: ':danger-full-access' },
+    { threadId: forked.body.thread.id, approvalPolicy: 'never', permissions: ':danger-full-access' },
+  ]);
   const snapshot = (await request('/api/snapshot')).body;
   assert.equal(snapshot.threads.find(x => x.id === forked.body.thread.id).title, 'Fork 验收对话');
 });
@@ -141,4 +151,19 @@ test('项目任务：新建归类，Fork 继承或清空，无效归类不创建
   assert.equal((await request('/api/threads', 'POST', { cwd: fixture.cwd, projectId: randomUUID() })).status, 400);
   assert.equal((await request('/api/threads', 'POST', { cwd: fixture.cwd, projectId: null, taskId })).status, 400);
   assert.equal(calls.length, count);
+});
+
+test('HTTP：最近回复按需读取，隐藏会话不可访问且不触发模型调用', async t => {
+  const { request, fixture, calls } = await setup(t);
+  const before = fixture.db.prepare('SELECT * FROM threads ORDER BY id').all();
+  const result = await request('/api/threads/' + fixture.ids[0] + '/replies');
+  assert.equal(result.status, 200);
+  assert.equal(result.body.replies.length, 1);
+  assert.equal(result.body.replies[0].text, fixture.names[0] + '已有进展');
+  assert.equal(result.body.limited, false);
+  assert.equal((await request('/api/threads/not-a-uuid/replies')).status, 400);
+  assert.equal((await request('/api/threads/55555555-5555-4555-8555-555555555555/replies')).status, 404);
+  assert.equal((await request('/api/threads/44444444-4444-4444-8444-444444444444/replies')).status, 404);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(fixture.db.prepare('SELECT * FROM threads ORDER BY id').all(), before);
 });

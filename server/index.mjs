@@ -3,13 +3,17 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { resolve, join, extname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { BoardStore, UUID } from './store.mjs';
 import { AppServerClient } from './app-server.mjs';
 import { EditorBridge } from './bridge.mjs';
+import { GitBranches } from './git.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const MAX_BODY = 1024 * 1024;
+// User-requested creation policy for new, forked, and inherited conversations.
+const CREATION_ACCESS = { approvalPolicy: 'never', permissions: ':danger-full-access' };
+const CREATION_ACCESS_SETTINGS = { approvalPolicy: 'never', permissions: ':danger-full-access' };
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8', '.woff2': 'font/woff2' };
 const fail = (message, status = 400) => Object.assign(new Error(message), { status });
 
@@ -40,11 +44,6 @@ function localRequest(request) {
   return ['localhost', '127.0.0.1', '[::1]'].includes(host);
 }
 
-function currentBranch(cwd) {
-  try { return execFileSync('git', ['-C', cwd, 'symbolic-ref', '--quiet', '--short', 'HEAD'], { timeout: 1500, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null; }
-  catch { return null; }
-}
-
 function validCwd(value) {
   if (typeof value !== 'string' || !value.startsWith('/') || value.length > 4096 || value.includes('\0')) throw fail('请选择本机的文件夹绝对路径');
   const cwd = resolve(value);
@@ -58,6 +57,33 @@ function validTitle(value, fallback) {
   return value.trim();
 }
 
+function inheritedStartOptions(settings) {
+  const params = {};
+  for (const key of ['model', 'modelProvider', 'serviceTier']) {
+    if (Object.hasOwn(settings, key)) params[key] = settings[key];
+  }
+  if (settings.reasoningEffort != null) params.config = { model_reasoning_effort: settings.reasoningEffort };
+  return params;
+}
+
+function inheritedUpdateOptions(settings, created) {
+  // Copy model/thinking preferences only. Permissions, approval policies,
+  // plugin configuration and other security settings are never copied.
+  const params = {};
+  for (const key of ['model', 'serviceTier', 'summary']) {
+    if (Object.hasOwn(settings, key)) params[key] = settings[key];
+  }
+  if (Object.hasOwn(settings, 'reasoningEffort')) params.effort = settings.reasoningEffort;
+  if (settings.collaborationMode) {
+    params.collaborationMode = { mode: settings.collaborationMode, settings: {
+      model: settings.model || created.model,
+      reasoning_effort: Object.hasOwn(settings, 'reasoningEffort') ? settings.reasoningEffort : created.reasoningEffort,
+      developer_instructions: null,
+    } };
+  }
+  return params;
+}
+
 export function createServer(options = {}) {
   const codexHome = options.codexHome || process.env.CODEX_BOARD_CODEX_HOME || join(homedir(), '.codex');
   const dataDir = options.dataDir || process.env.CODEX_BOARD_DATA_DIR || join(homedir(), '.local', 'share', 'codex-board');
@@ -65,9 +91,12 @@ export function createServer(options = {}) {
   const store = new BoardStore({ codexHome, dataDir });
   const appServer = options.appServer || new AppServerClient({ codexHome, binary: options.codexBinary });
   const bridge = options.bridge || new EditorBridge({ dataDir, ...options.bridgeOptions });
+  const branches = options.branches || new GitBranches();
+  const creationRequests = new Map();
   const clients = new Set();
   let lastSnapshot = '';
   let operationInFlight = false;
+  let replyReads = 0;
   let closed = false;
 
   function snapshot() {
@@ -75,9 +104,9 @@ export function createServer(options = {}) {
     try { threads = store.threads(); } catch (problem) { error = problem.message; }
     return {
       threads,
-      graph: store.graph(),
+      graph: store.graph(new Set(threads.map(thread => thread.id))),
       organization: store.organization(),
-      capabilities: { create: !options.disableActions, fork: !options.disableActions, openVscode: !options.disableOpen },
+      capabilities: { create: !options.disableActions, fork: !options.disableActions, inherit: !options.disableActions, openVscode: !options.disableOpen },
       ...(error ? { error } : {}),
     };
   }
@@ -100,11 +129,44 @@ export function createServer(options = {}) {
     return thread;
   }
 
-  async function createThread(body, parent = null) {
-    if (options.disableActions) throw fail('本环境未启用新建和 Fork', 503);
-    if (operationInFlight) throw fail('上一个新建或 Fork 正在完成，请稍后重试', 409);
+  async function createRequest(body, parentId = null, kind = 'new') {
+    if (options.disableActions) throw fail('本环境未启用新建、Fork 和继承', 503);
+    if (parentId && !UUID.test(parentId)) throw fail('对话 ID 格式无效');
+    const requestId = body.requestId;
+    if (requestId !== undefined && (typeof requestId !== 'string' || !UUID.test(requestId))) throw fail('创建请求标识无效');
+    if (requestId === undefined) return createThread(body, parentId ? findThread(parentId) : null, kind);
+    // Hash only supported inputs, in a stable order. Keeping omitted fields
+    // distinct preserves the difference between inherited and cleared assignments.
+    const input = { kind, parentId };
+    for (const key of ['cwd', 'title', 'projectId', 'taskId', ...(kind === 'inherit' ? ['prompt'] : [])]) {
+      if (Object.hasOwn(body, key)) input[key] = body[key];
+    }
+    const fingerprint = createHash('sha256').update(JSON.stringify(input)).digest('hex');
+    const pending = creationRequests.get(requestId);
+    const receipt = pending || store.creationRequest(requestId);
+    if (receipt) {
+      if (receipt.fingerprint !== fingerprint) throw fail('此创建请求的内容已改变，请重新提交', 409);
+      if (pending) return pending.promise;
+      // Replay before looking up the parent: it might have been archived since
+      // successful creation. An archived child must never cause a duplicate.
+      const thread = store.threads().find(thread => thread.id === receipt.threadId);
+      if (!thread) throw fail(`本请求已创建对话 ${receipt.threadId}，该对话已归档或不可用，请刷新看板`, 410);
+      return thread;
+    }
+    const promise = createThread(body, parentId ? findThread(parentId) : null, kind, { requestId, fingerprint });
+    creationRequests.set(requestId, { fingerprint, promise });
+    try { return await promise; }
+    finally { creationRequests.delete(requestId); }
+  }
+
+  async function createThread(body, parent = null, kind = 'new', receipt = {}) {
+    const inheriting = kind === 'inherit';
+    if (options.disableActions) throw fail('本环境未启用新建、Fork 和继承', 503);
+    if (operationInFlight) throw fail('上一个对话正在创建，请稍后重试', 409);
     const cwd = validCwd(body.cwd || parent?.cwd);
-    const title = validTitle(body.title, parent ? `${parent.title.slice(0, 100)} · Fork` : '新对话');
+    const title = validTitle(body.title, parent ? `${parent.title.slice(0, 100)} · ${inheriting ? '续聊' : 'Fork'}` : '新对话');
+    const prompt = inheriting ? body.prompt : null;
+    if (inheriting && (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 12000 || prompt.includes('\0'))) throw fail('交接提示词须为 1 到 12000 个字符');
     const organization = store.organization();
     const assignment = Object.hasOwn(body, 'projectId')
       ? { projectId: body.projectId, taskId: body.taskId || null }
@@ -112,13 +174,27 @@ export function createServer(options = {}) {
     if (assignment?.projectId != null && !organization.projects.some(project => project.id === assignment.projectId)) throw fail('项目不存在');
     if (assignment?.taskId && !organization.tasks.some(task => task.id === assignment.taskId && task.projectId === assignment.projectId)) throw fail('任务不属于所选项目');
     operationInFlight = true;
+    let createdId = null;
     try {
-      const result = parent
-        ? await appServer.request('thread/fork', { threadId: parent.id, cwd, excludeTurns: true, ephemeral: false })
-        : await appServer.request('thread/start', { cwd, ephemeral: false, historyMode: 'legacy', persistExtendedHistory: true });
+      const sourceSettings = inheriting ? await store.threadSettings(parent.id) : {};
+      const result = parent && !inheriting
+        ? await appServer.request('thread/fork', { threadId: parent.id, cwd, excludeTurns: true, ephemeral: false, ...CREATION_ACCESS })
+        : await appServer.request('thread/start', { cwd, ephemeral: false, historyMode: 'legacy', persistExtendedHistory: true, ...(inheriting ? inheritedStartOptions(sourceSettings) : {}), ...CREATION_ACCESS });
       const created = result.thread;
       if (!created || !UUID.test(created.id)) throw fail('Codex 未返回有效的会话 ID', 502);
+      if (parent && created.id === parent.id) throw fail('Codex 未创建独立的新对话，已停止操作。', 502);
+      createdId = created.id;
       await appServer.request('thread/name/set', { threadId: created.id, name: title });
+      const settings = inheriting ? inheritedUpdateOptions(sourceSettings, result) : {};
+      await appServer.request('thread/settings/update', { threadId: created.id, ...settings, ...CREATION_ACCESS_SETTINGS });
+      if (inheriting) {
+        // Seed a fresh model-visible history without starting inference. Never
+        // copy the source rollout or modify the user's Codex database directly.
+        await appServer.request('thread/inject_items', {
+          threadId: created.id,
+          items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] }],
+        });
+      }
       // Release app-server's live agent after the metadata operation. This also
       // flushes durable history before a different VS Code process resumes it.
       await appServer.request('thread/unsubscribe', { threadId: created.id });
@@ -128,20 +204,33 @@ export function createServer(options = {}) {
       const thread = {
         id: created.id,
         title,
-        preview: created.preview || parent?.preview || '',
+        preview: inheriting ? `已继承「${parent.title}」的交接提示词，可继续对话。` : created.preview || parent?.preview || '',
         cwd: created.cwd || cwd,
         project: basename(created.cwd || cwd),
-        branch: created.gitInfo?.branch || currentBranch(cwd),
+        branch: created.gitInfo?.branch || await branches.get(cwd),
         updatedAt: (created.updatedAt || Math.floor(Date.now() / 1000)) * 1000,
         createdAt: (created.createdAt || Math.floor(Date.now() / 1000)) * 1000,
-        forkedFromId: parent?.id || created.forkedFromId || null,
+        forkedFromId: inheriting ? null : parent?.id || created.forkedFromId || null,
+        inheritedFromId: inheriting ? parent.id : null,
         status: 'unknown',
         archived: false,
       };
-      store.remember(thread);
-      if (assignment?.projectId) store.updateOrganization({ action: 'assign', threadIds: [thread.id], ...assignment }, new Set([thread.id]));
+      store.remember(inheriting ? {
+        ...thread,
+        inheritance: { source: { id: parent.id, title: parent.title, cwd: parent.cwd }, prompt, settings: sourceSettings },
+      } : thread, { ...receipt, assignment: assignment?.projectId ? assignment : null });
       broadcast(true);
       return thread;
+    } catch (error) {
+      if (createdId) {
+        // Failed access/settings/history setup must not look successful
+        // or leave another incomplete conversation on every retry.
+        await appServer.request('thread/unsubscribe', { threadId: createdId }).catch(() => {});
+        try { await appServer.request('thread/archive', { threadId: createdId }); }
+        catch { throw fail(`${inheriting ? '继承' : '对话创建'}未完成：${error.message}。新建的对话 ${createdId} 未能自动归档，请在看板中检查后再重试。`, 502); }
+        throw fail(`${inheriting ? '继承' : '对话创建'}未完成：${error.message}。本次未完成的对话已归档，交接内容可以保留后重试。`, 502);
+      }
+      throw error;
     } finally { operationInFlight = false; }
   }
 
@@ -184,8 +273,9 @@ export function createServer(options = {}) {
       }
       if (request.method === 'GET' && ['/api/projects', '/api/folders'].includes(pathname)) {
         const projects = new Map();
-        for (const thread of store.threads()) if (!projects.has(thread.cwd)) projects.set(thread.cwd, { cwd: thread.cwd, name: thread.project, branch: currentBranch(thread.cwd) });
-        return json(response, 200, { projects: [...projects.values()].sort((a, b) => a.cwd.localeCompare(b.cwd)) });
+        for (const thread of store.threads()) if (!projects.has(thread.cwd)) projects.set(thread.cwd, { cwd: thread.cwd, name: thread.project });
+        const folders = await Promise.all([...projects.values()].map(async folder => ({ ...folder, branch: await branches.get(folder.cwd) })));
+        return json(response, 200, { projects: folders.sort((a, b) => a.cwd.localeCompare(b.cwd)) });
       }
       if (request.method === 'PATCH' && pathname === '/api/organization') {
         const organization = store.updateOrganization(await readJson(request), new Set(store.threads().map(thread => thread.id)));
@@ -199,10 +289,37 @@ export function createServer(options = {}) {
         return json(response, 200, { graph });
       }
       if (request.method === 'POST' && pathname === '/api/threads') {
-        return json(response, 201, { thread: await createThread(await readJson(request)) });
+        return json(response, 201, { thread: await createRequest(await readJson(request)) });
       }
+      const repliesMatch = pathname.match(/^\/api\/threads\/([^/]+)\/replies$/);
+      if (request.method === 'GET' && repliesMatch) {
+        const thread = findThread(repliesMatch[1]);
+        if (replyReads >= 2) throw fail('正在读取其他回复，请稍后重试。', 429);
+        replyReads++;
+        try { return json(response, 200, await store.replies(thread.id)); }
+        catch (error) { throw fail(error.code === 'ENOENT' ? '这条对话的回复文件不在本机。' : '回复暂时无法读取，请稍后重试。', 503); }
+        finally { replyReads--; }
+      }
+      const handoffMatch = pathname.match(/^\/api\/threads\/([^/]+)\/handoff$/);
+      if (request.method === 'GET' && handoffMatch) {
+        const thread = findThread(handoffMatch[1]);
+        if (replyReads >= 2) throw fail('正在读取其他对话，请稍后重试。', 429);
+        replyReads++;
+        try { return json(response, 200, await store.handoff(thread)); }
+        catch (error) { throw fail(error.code === 'ENOENT' ? '这条对话的历史文件不在本机，无法生成交接内容。' : error.message || '交接内容暂时无法读取，请稍后重试。', 503); }
+        finally { replyReads--; }
+      }
+      const inheritanceMatch = pathname.match(/^\/api\/threads\/([^/]+)\/inheritance$/);
+      if (request.method === 'GET' && inheritanceMatch) {
+        const thread = findThread(inheritanceMatch[1]);
+        const inheritance = store.inheritance(thread.id);
+        if (!inheritance) throw fail('这条对话没有保存的交接提示词', 404);
+        return json(response, 200, inheritance);
+      }
+      const inheritMatch = pathname.match(/^\/api\/threads\/([^/]+)\/inherit$/);
+      if (request.method === 'POST' && inheritMatch) return json(response, 201, { thread: await createRequest(await readJson(request), inheritMatch[1], 'inherit') });
       const forkMatch = pathname.match(/^\/api\/threads\/([^/]+)\/fork$/);
-      if (request.method === 'POST' && forkMatch) return json(response, 201, { thread: await createThread(await readJson(request), findThread(forkMatch[1])) });
+      if (request.method === 'POST' && forkMatch) return json(response, 201, { thread: await createRequest(await readJson(request), forkMatch[1], 'fork') });
       const openMatch = pathname.match(/^\/api\/threads\/([^/]+)\/open-vscode$/);
       if (request.method === 'POST' && openMatch) {
         const body = await readJson(request);

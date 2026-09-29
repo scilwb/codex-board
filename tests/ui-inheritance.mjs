@@ -1,0 +1,345 @@
+import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chromium } from 'playwright';
+import { expect } from '@playwright/test';
+import { createServer } from '../server/index.mjs';
+import { makeFixture } from './fixture.mjs';
+
+const fixture = makeFixture();
+const calls = [];
+const opened = [];
+const inheritBodies = [];
+const errors = [];
+const results = [];
+const pathFor = id => fixture.db.prepare('SELECT rollout_path FROM threads WHERE id=?').get(id)?.rollout_path;
+const sourceId = fixture.ids[0];
+const sourceSettings = { model: 'gpt-6-astra', modelProvider: 'openai', reasoningEffort: 'ultra', collaborationMode: 'default' };
+appendFileSync(pathFor(sourceId), JSON.stringify({ timestamp: new Date().toISOString(), type: 'turn_context', payload: {
+  model: sourceSettings.model, effort: sourceSettings.reasoningEffort,
+  collaboration_mode: { mode: sourceSettings.collaborationMode, settings: { model: sourceSettings.model, reasoning_effort: sourceSettings.reasoningEffort, developer_instructions: null } },
+} }) + '\n');
+const sourceBefore = readFileSync(pathFor(sourceId), 'utf8');
+let failNextInjection = false;
+let failNextOpen = false;
+let injectionGate = null;
+let releaseInjection = null;
+let releasePreview = null;
+const appServer = { async request(method, params) {
+  calls.push({ method, params });
+  if (method === 'thread/start') {
+    assert.equal(params.approvalPolicy, 'never');
+    assert.equal(params.permissions, ':danger-full-access');
+    assert.equal(Object.hasOwn(params, 'sandbox'), false);
+    assert.equal(params.model, sourceSettings.model);
+    assert.equal(params.modelProvider, sourceSettings.modelProvider);
+    assert.equal(params.config?.model_reasoning_effort, sourceSettings.reasoningEffort);
+    const id = randomUUID();
+    fixture.insert({ id, title: '虚构的新对话', source: 'appServer' });
+    writeFileSync(pathFor(id), JSON.stringify({ type: 'session_meta', payload: { id, cwd: params.cwd } }) + '\n');
+    return { thread: { id, path: pathFor(id), cwd: params.cwd } };
+  }
+  if (method === 'thread/name/set') {
+    fixture.db.prepare('UPDATE threads SET name=? WHERE id=?').run(params.name, params.threadId);
+    return {};
+  }
+  if (method === 'thread/settings/update') {
+    assert.equal(params.approvalPolicy, 'never');
+    assert.equal(params.permissions, ':danger-full-access');
+    assert.equal(Object.hasOwn(params, 'sandboxPolicy'), false);
+    assert.equal(params.model, sourceSettings.model);
+    assert.equal(params.effort, sourceSettings.reasoningEffort);
+    assert.deepEqual(params.collaborationMode, { mode: sourceSettings.collaborationMode, settings: { model: sourceSettings.model, reasoning_effort: sourceSettings.reasoningEffort, developer_instructions: null } });
+    return {};
+  }
+  if (method === 'thread/inject_items') {
+    if (failNextInjection) { failNextInjection = false; throw new Error('模拟交接上下文注入失败'); }
+    if (injectionGate) await injectionGate;
+    for (const item of params.items) appendFileSync(pathFor(params.threadId), JSON.stringify({ type: 'response_item', payload: item }) + '\n');
+    return {};
+  }
+  if (method === 'thread/unsubscribe') return {};
+  if (method === 'thread/archive') {
+    fixture.db.prepare('UPDATE threads SET archived=1 WHERE id=?').run(params.threadId);
+    return {};
+  }
+  throw new Error(`Unexpected operation; model execution is forbidden in this fixture: ${method}`);
+} };
+const bridge = {
+  windows: () => [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', title: '虚构的实验工作区', folders: [fixture.cwd], openThreads: [] }],
+  async open(id, windowId) {
+    opened.push({ id, windowId });
+    if (failNextOpen) { failNextOpen = false; throw new Error('模拟 VS Code 打开失败'); }
+    return { opened: true, editorOpened: true, verified: true, reused: false };
+  },
+  close() {},
+};
+const server = createServer({ ...fixture, appServer, bridge, pollIntervalMs: 100 });
+server.listen(0, '127.0.0.1');
+await once(server, 'listening');
+const base = `http://127.0.0.1:${server.address().port}`;
+const patchOrganization = async body => {
+  const response = await fetch(`${base}/api/organization`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  assert.equal(response.status, 200);
+  return (await response.json()).organization;
+};
+let browser;
+let page;
+let handoffRequests = 0;
+let inheritanceRequests = 0;
+let firstCreatedId;
+const editedTitle = '相机验证 · 接续实验';
+const editedPrompt = '目标：完成双相机时间戳验证。\n已有决定：使用方案 B，保持当前标定参数。\n下一步待办：检查采样间隔，整理验证结果。';
+const starts = () => calls.filter(call => call.method === 'thread/start').length;
+const selectThread = async id => {
+  await page.getByTestId('project-all').click();
+  await page.getByTestId(`thread-list-${id}`).click();
+  await expect(page.getByTestId('detail-thread-id')).toHaveText(id);
+};
+async function check(name, operation) {
+  const start = performance.now();
+  await operation();
+  results.push({ name, result: 'PASS', durationMs: Math.round(performance.now() - start) });
+  console.log(`PASS ${name}`);
+}
+mkdirSync('artifacts', { recursive: true });
+try {
+  const project = (await patchOrganization({ action: 'createProject', name: '虚构视觉研究' })).projects[0];
+  const task = (await patchOrganization({ action: 'createTask', projectId: project.id, name: '相机验证' })).tasks[0];
+  await patchOrganization({ action: 'assign', threadIds: [sourceId], projectId: project.id, taskId: task.id });
+  browser = await chromium.launch({ ...(process.env.PLAYWRIGHT_BUNDLED ? {} : { channel: 'chrome' }), headless: true });
+  const context = await browser.newContext({ viewport: { width: 1512, height: 1050 }, permissions: ['clipboard-read', 'clipboard-write'] });
+  page = await context.newPage();
+  page.on('pageerror', error => errors.push(error.message));
+  page.on('request', request => {
+    if (request.url().endsWith('/handoff')) handoffRequests++;
+    if (request.url().endsWith('/inheritance')) inheritanceRequests++;
+    if (request.method() === 'POST' && request.url().endsWith('/inherit')) inheritBodies.push(request.postDataJSON());
+  });
+  await page.goto(base);
+  await check('继承入口按需读取公开摘录，继承目录与分类并允许编辑', async () => {
+    await expect(page.getByTestId('thread-list').locator('button')).toHaveCount(3);
+    assert.equal(handoffRequests, 0);
+    assert.equal(inheritanceRequests, 0);
+    assert.equal(calls.length, 0);
+    await page.getByTestId('new-thread').click();
+    await expect(page.getByTestId('modal-permissions')).toHaveText('Full Access· 完整文件与命令访问，无需逐项审批');
+    await page.getByTestId('modal-cancel').click();
+    await page.getByTestId(`fork-${sourceId}`).click();
+    await expect(page.getByTestId('modal-permissions')).toContainText('Full Access');
+    await page.getByTestId('modal-cancel').click();
+    assert.equal(handoffRequests, 0);
+    await page.getByTestId(`inherit-${sourceId}`).click();
+    await expect(page.getByTestId('modal-permissions')).toContainText('完整文件与命令访问，无需逐项审批');
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    await expect(page.getByTestId('modal-title')).toHaveValue(`${fixture.names[0]} · 续聊`);
+    await expect(page.getByTestId('modal-cwd')).toHaveValue(fixture.cwd);
+    await expect(page.getByTestId('modal-project')).toHaveValue(project.id);
+    await expect(page.getByTestId('modal-task')).toHaveValue(task.id);
+    await expect(page.getByTestId('inherit-settings-model')).toHaveText(sourceSettings.model);
+    await expect(page.getByTestId('inherit-settings-modelProvider')).toHaveText('openai');
+    await expect(page.getByTestId('inherit-settings-reasoningEffort')).toHaveText('极高');
+    await expect(page.getByTestId('inherit-settings-collaborationMode')).toHaveText('默认模式');
+    await expect(page.getByTestId('inherit-settings-plan-note')).toHaveCount(0);
+    await expect(page.getByTestId('inherit-settings').locator('input, select, textarea')).toHaveCount(0);
+    assert.ok((await page.getByTestId('inherit-prompt').inputValue()).includes(`请处理${fixture.names[0]}`));
+    assert.equal(handoffRequests, 1);
+    assert.equal(calls.length, 0);
+    await page.getByTestId('modal-title').fill(editedTitle);
+    await page.getByTestId('inherit-prompt').fill(editedPrompt);
+    await expect(page.getByTestId('inherit-prompt-count')).toHaveText(`${editedPrompt.length} / 12000`);
+    await expect(page.getByTestId('thread-modal')).toContainText('发送下一条消息即可继续');
+    await page.screenshot({ path: 'artifacts/ui-inheritance-modal.png', fullPage: true });
+  });
+  await check('注入失败保留编辑内容，重试期间禁止重复创建', async () => {
+    failNextInjection = true;
+    await page.getByTestId('modal-submit').click();
+    await expect(page.getByTestId('modal-error')).toContainText('已归档');
+    await expect(page.getByTestId('modal-title')).toHaveValue(editedTitle);
+    await expect(page.getByTestId('inherit-prompt')).toHaveValue(editedPrompt);
+    await expect(page.getByTestId('modal-submit')).toBeEnabled();
+    assert.equal(starts(), 1);
+    assert.equal(calls.filter(call => call.method === 'thread/archive').length, 1);
+    assert.equal(opened.length, 0);
+    assert.equal(readFileSync(pathFor(sourceId), 'utf8'), sourceBefore);
+    injectionGate = new Promise(resolve => { releaseInjection = resolve; });
+    await page.getByTestId('modal-submit').click();
+    await expect.poll(() => calls.filter(call => call.method === 'thread/inject_items').length).toBe(2);
+    await expect(page.getByTestId('modal-submit')).toBeDisabled();
+    await expect(page.getByTestId('modal-cancel')).toBeDisabled();
+    await expect(page.getByTestId('inherit-prompt')).toBeDisabled();
+    await page.getByTestId('thread-modal').locator('form').evaluate(form => form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+    assert.equal(starts(), 2);
+    releaseInjection(); injectionGate = null;
+    await expect(page.getByTestId('thread-modal')).toHaveCount(0);
+    await expect.poll(() => opened.length).toBe(1);
+    firstCreatedId = await page.getByTestId('detail-thread-id').textContent();
+    assert.notEqual(firstCreatedId, sourceId);
+    assert.equal(opened[0].id, firstCreatedId);
+    const created = server.board.snapshot().threads.find(thread => thread.id === firstCreatedId);
+    assert.equal(created.forkedFromId, null);
+    assert.equal(created.inheritedFromId, sourceId);
+    assert.deepEqual(server.board.store.organization().assignments[firstCreatedId], { projectId: project.id, taskId: task.id });
+    assert.equal(server.board.store.inheritance(firstCreatedId).prompt, editedPrompt);
+    assert.deepEqual(server.board.store.inheritance(firstCreatedId).settings, sourceSettings);
+    assert.equal(calls.filter(call => call.method === 'thread/settings/update').length, 2);
+    assert.deepEqual(Object.keys(inheritBodies.at(-1)).sort(), ['cwd', 'projectId', 'prompt', 'requestId', 'taskId', 'title']);
+    await expect(page.getByTestId('detail-inherited-from')).toHaveText(sourceId);
+    await expect(page.getByTestId('inheritance-context')).toContainText('交接上下文已载入');
+    await page.screenshot({ path: 'artifacts/ui-inheritance-created.png', fullPage: true });
+  });
+  await check('继承关系区别于 Fork，可查看来源且不能删除', async () => {
+    await page.getByTestId('project-all').click();
+    await expect(page.getByTestId('thread-list').locator('button')).toHaveCount(4);
+    await page.locator('.react-flow__controls-fitview').click();
+    const edge = page.locator(`.react-flow__edge[data-id="inherit:${firstCreatedId}"]`);
+    await expect(edge).toBeVisible();
+    await expect(edge).toContainText('继承');
+    await edge.locator('.react-flow__edge-textwrapper').click();
+    await expect(page.getByTestId('edge-detail')).toContainText('继承关系');
+    await expect(page.getByTestId('inherit-source-id')).toHaveText(sourceId);
+    await expect(page.getByTestId('delete-edge')).toHaveCount(0);
+    await page.getByTestId('inherit-view-source').click();
+    await expect(page.getByTestId('detail-thread-id')).toHaveText(sourceId);
+  });
+  await check('详情按需查看和复制实际提示词，刷新后内容与关系保留', async () => {
+    await selectThread(firstCreatedId);
+    assert.equal(inheritanceRequests, 0);
+    await page.getByTestId('show-inheritance').click();
+    await expect(page.getByTestId('inheritance-prompt')).toHaveText(editedPrompt);
+    assert.equal(inheritanceRequests, 1);
+    await expect(page.getByTestId('inheritance-settings-model')).toHaveText(sourceSettings.model);
+    await expect(page.getByTestId('inheritance-settings-reasoningEffort')).toHaveText('极高');
+    await expect(page.getByTestId('inheritance-settings-collaborationMode')).toHaveText('默认模式');
+    await page.getByTestId('inheritance-copy').click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), editedPrompt);
+    await page.getByTestId('collapse-inheritance').click();
+    await expect(page.getByTestId('inheritance-prompt')).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByTestId('thread-list').locator('button')).toHaveCount(4);
+    await expect(page.locator(`.react-flow__edge[data-id="inherit:${firstCreatedId}"]`)).toBeVisible();
+    assert.equal(inheritanceRequests, 1);
+    await selectThread(firstCreatedId);
+    await page.getByTestId('show-inheritance').click();
+    await expect(page.getByTestId('inheritance-prompt')).toHaveText(editedPrompt);
+    assert.equal(inheritanceRequests, 2);
+    await expect(page.getByTestId('inheritance-settings-model')).toHaveText(sourceSettings.model);
+  });
+  await check('自动打开失败时保留新卡，重试打开不重复创建', async () => {
+    await selectThread(sourceId);
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    await page.getByTestId('modal-title').fill('虚构的续聊 · 手动定位');
+    await page.getByTestId('inherit-prompt').fill('仅继续检查采集日志。');
+    failNextOpen = true;
+    await page.getByTestId('modal-submit').click();
+    await expect(page.getByTestId('thread-modal')).toHaveCount(0);
+    await expect(page.getByTestId('toast')).toContainText('打开失败');
+    const secondCreatedId = await page.getByTestId('detail-thread-id').textContent();
+    assert.notEqual(secondCreatedId, sourceId);
+    assert.notEqual(secondCreatedId, firstCreatedId);
+    await expect(page.getByTestId(`session-node-${secondCreatedId}`)).toBeVisible();
+    const attempts = starts();
+    assert.equal(attempts, 3);
+    assert.equal(opened.at(-1).id, secondCreatedId);
+    await page.getByTestId('detail-open').click();
+    await expect(page.getByTestId('toast')).toContainText('已打开');
+    assert.equal(opened.at(-1).id, secondCreatedId);
+    assert.equal(starts(), attempts);
+    assert.equal(server.board.snapshot().threads.length, 5);
+  });
+  await check('交接预览读取失败可重试，取消后旧请求不会污染下一张卡', async () => {
+    const otherId = fixture.ids[1];
+    const otherUrl = `${base}/api/threads/${otherId}/handoff`;
+    let failPreview = true;
+    await page.route(otherUrl, route => {
+      if (failPreview) { failPreview = false; return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: '模拟预览读取失败' }) }); }
+      return route.continue();
+    });
+    await selectThread(otherId);
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-error')).toContainText('模拟预览读取失败');
+    await expect(page.getByTestId('modal-submit')).toBeDisabled();
+    await page.getByTestId('inherit-retry').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    assert.ok((await page.getByTestId('inherit-prompt').inputValue()).includes(fixture.names[1]));
+    await page.getByTestId('modal-cancel').click();
+    await page.unroute(otherUrl);
+
+    const delayedUrl = `${base}/api/threads/${sourceId}/handoff`;
+    let entered = false;
+    const gate = new Promise(resolve => { releasePreview = resolve; });
+    await page.route(delayedUrl, async route => {
+      const response = await route.fetch(); entered = true;
+      await gate;
+      await route.fulfill({ response }).catch(() => {});
+    });
+    await selectThread(sourceId);
+    await page.getByTestId('detail-inherit').click();
+    await expect.poll(() => entered).toBe(true);
+    await expect(page.getByTestId('inherit-loading')).toBeVisible();
+    await page.getByTestId('modal-cancel').click();
+    await selectThread(otherId);
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    const otherPrompt = await page.getByTestId('inherit-prompt').inputValue();
+    releasePreview();
+    await page.unroute(delayedUrl);
+    await expect(page.getByTestId('inherit-prompt')).toHaveValue(otherPrompt);
+    await expect(page.getByTestId('inherit-origin')).toContainText(fixture.names[1]);
+  });
+  await check('缺失配置使用默认说明，计划模式与显式默认值正确展示', async () => {
+    await page.getByTestId('modal-cancel').click();
+    const otherId = fixture.ids[1];
+    const url = `${base}/api/threads/${otherId}/handoff`;
+    let settings = {};
+    await page.route(url, async route => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { ...(await response.json()), settings } });
+    });
+    await selectThread(otherId);
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    await expect(page.getByTestId('inherit-settings')).toContainText('来源未记录此设置，使用 Codex 默认值');
+    await expect(page.getByTestId('inherit-settings-model')).toHaveCount(0);
+    await page.getByTestId('modal-cancel').click();
+    settings = { model: 'gpt-6-astra', reasoningEffort: null, collaborationMode: 'plan', serviceTier: null };
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    await expect(page.getByTestId('inherit-settings-reasoningEffort')).toHaveText('默认');
+    await expect(page.getByTestId('inherit-settings-serviceTier')).toHaveText('默认');
+    await expect(page.getByTestId('inherit-settings-collaborationMode')).toHaveText('计划模式');
+    await expect(page.getByTestId('inherit-settings-plan-note')).toHaveText('已保存计划模式；打开 VS Code 后请核对计划开关。');
+    await page.unroute(url);
+  });
+  await check('窄屏弹窗可编辑取消，空提示禁提交，没有模型调用或浏览器错误', async () => {
+    await page.setViewportSize({ width: 600, height: 800 });
+    await page.getByTestId('inherit-prompt').fill('');
+    await expect(page.getByTestId('modal-submit')).toBeDisabled();
+    await page.getByTestId('inherit-prompt').fill('目标：继续虚构实验。');
+    await expect(page.getByTestId('modal-submit')).toBeEnabled();
+    await page.getByTestId('modal-submit').scrollIntoViewIfNeeded();
+    const button = await page.getByTestId('modal-submit').boundingBox();
+    assert.ok(button.x >= 0 && button.x + button.width <= 600 && button.y >= 0 && button.y + button.height <= 800);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    assert.equal(await page.getByTestId('thread-modal').evaluate(element => element.scrollWidth > element.clientWidth), false);
+    await page.getByTestId('modal-cancel').click();
+    await expect(page.getByTestId('thread-modal')).toHaveCount(0);
+    assert.equal(readFileSync(pathFor(sourceId), 'utf8'), sourceBefore);
+    assert.equal(calls.some(call => call.method === 'turn/start' || call.method === 'thread/fork'), false);
+    assert.deepEqual(errors, []);
+  });
+  writeFileSync('artifacts/ui-inheritance-results.json', JSON.stringify({ environment: 'Isolated fictional fixture; injected metadata client; no model turns', results, errors }, null, 2));
+} catch (error) {
+  if (page) await page.screenshot({ path: 'artifacts/ui-inheritance-failure.png', fullPage: true }).catch(() => {});
+  console.error(error);
+  console.error('Browser errors:', errors);
+  process.exitCode = 1;
+} finally {
+  releaseInjection?.(); releasePreview?.();
+  await browser?.close();
+  server.board.closeStreams();
+  const closed = once(server, 'close'); server.close(); server.closeAllConnections(); await closed;
+  fixture.cleanup();
+}

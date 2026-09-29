@@ -1,27 +1,106 @@
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, readSync, statSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { RolloutMonitor, recentReplies } from './activity.mjs';
+import { buildHandoff } from './handoff.mjs';
+import { readThreadSettings } from './thread-settings.mjs';
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const shorten = (value, limit = 240) => typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, limit) : '';
 const timestamp = (seconds, milliseconds) => Number(milliseconds) > 0 ? Number(milliseconds) : Number(seconds || 0) * 1000;
+const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const digest = value => value === null ? null : createHash('sha256').update(value).digest('hex');
+const defaultOrganization = () => ({ projects: [], tasks: [], assignments: {} });
+const defaultState = () => ({ version: 1, positions: {}, edges: [], managedThreads: {}, organization: defaultOrganization(), creationRequests: {} });
+
+function parseState(raw) {
+  const parsed = JSON.parse(raw);
+  if (!isRecord(parsed) || (parsed.positions !== undefined && !isRecord(parsed.positions)) ||
+    (parsed.edges !== undefined && !Array.isArray(parsed.edges)) ||
+    (parsed.managedThreads !== undefined && !isRecord(parsed.managedThreads)) ||
+    (parsed.creationRequests !== undefined && !isRecord(parsed.creationRequests)) ||
+    (parsed.organization !== undefined && parsed.organization !== null && !isRecord(parsed.organization))) throw new Error('Codex Board 元数据结构无效');
+  const organization = parsed.organization || defaultOrganization();
+  if ((organization.projects !== undefined && !Array.isArray(organization.projects)) ||
+    (organization.tasks !== undefined && !Array.isArray(organization.tasks)) ||
+    (organization.assignments !== undefined && !isRecord(organization.assignments)) ||
+    (organization.projects || []).some(item => !isRecord(item) || typeof item.id !== 'string' || typeof item.name !== 'string') ||
+    (organization.tasks || []).some(item => !isRecord(item) || typeof item.id !== 'string' || typeof item.projectId !== 'string' || typeof item.name !== 'string') ||
+    Object.values(organization.assignments || {}).some(item => !isRecord(item))) throw new Error('Codex Board 项目元数据结构无效');
+  if (Object.values(parsed.positions || {}).some(value => !isRecord(value) || !Number.isFinite(value.x) || !Number.isFinite(value.y)) ||
+    (parsed.edges || []).some(edge => !isRecord(edge) || typeof edge.id !== 'string' || typeof edge.source !== 'string' || typeof edge.target !== 'string' || typeof edge.type !== 'string') ||
+    Object.values(parsed.managedThreads || {}).some(value => !isRecord(value)) ||
+    Object.entries(parsed.creationRequests || {}).some(([id, receipt]) => !UUID.test(id) || !isRecord(receipt) ||
+      typeof receipt.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(receipt.fingerprint) || !UUID.test(receipt.threadId))) throw new Error('Codex Board 元数据结构无效');
+  return { ...defaultState(), ...parsed, organization: { ...defaultOrganization(), ...organization } };
+}
+
+function writeAtomic(path, content) {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, content, { flag: 'wx', mode: 0o600, flush: true });
+    renameSync(temporary, path);
+  } finally { rmSync(temporary, { force: true }); }
+}
+
+function acquireWriteLock(path) {
+  const conflict = () => Object.assign(new Error('另一个 Codex Board 实例正在保存元数据，请稍后重试'), { status: 409 });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      mkdirSync(path, { mode: 0o700 });
+      try { writeFileSync(join(path, 'owner'), String(process.pid), { flag: 'wx', mode: 0o600 }); }
+      catch (error) { rmSync(path, { recursive: true, force: true }); throw error; }
+      return () => rmSync(path, { recursive: true, force: true });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let stale = false;
+      try {
+        const age = Date.now() - statSync(path).mtimeMs;
+        let pid = null;
+        try { pid = Number(readFileSync(join(path, 'owner'), 'utf8')); } catch { /* owner may not be written yet */ }
+        if (Number.isSafeInteger(pid) && pid > 0) {
+          try { process.kill(pid, 0); } catch (error) { stale = error.code === 'ESRCH'; }
+        } else stale = age > 5000;
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (!stale || attempt > 0) throw conflict();
+      rmSync(path, { recursive: true, force: true });
+    }
+  }
+  throw conflict();
+}
 
 export class BoardStore {
   constructor({ codexHome, dataDir }) {
     this.codexHome = codexHome;
     this.dataDir = dataDir;
     this.graphPath = join(dataDir, 'board.json');
+    this.backupPath = `${this.graphPath}.bak`;
+    this.lockPath = `${this.graphPath}.lock`;
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    this.state = { version: 1, positions: {}, edges: [], managedThreads: {}, organization: { projects: [], tasks: [], assignments: {} } };
-    if (existsSync(this.graphPath)) {
-      const parsed = JSON.parse(readFileSync(this.graphPath, 'utf8'));
-      this.state = { ...this.state, ...parsed };
+    const primary = existsSync(this.graphPath) ? readFileSync(this.graphPath, 'utf8') : null;
+    this.revision = digest(primary);
+    this.recoveredFromBackup = false;
+    this.corruptPreservedRevision = null;
+    this.state = defaultState();
+    if (primary !== null) {
+      try { this.state = parseState(primary); }
+      catch (error) {
+        if (!existsSync(this.backupPath)) throw new Error('Codex Board 元数据已损坏，且没有可用备份；原文件已保留', { cause: error });
+        try { this.state = parseState(readFileSync(this.backupPath, 'utf8')); }
+        catch (backupError) { throw new Error('Codex Board 元数据和备份均已损坏；原文件已保留', { cause: backupError }); }
+        this.recoveredFromBackup = true;
+        console.warn('Codex Board 元数据损坏，已从备份恢复；损坏原件会在下次写入前另存。');
+      }
+    } else if (existsSync(this.backupPath)) {
+      try { this.state = parseState(readFileSync(this.backupPath, 'utf8')); }
+      catch (error) { throw new Error('Codex Board 元数据备份已损坏；原文件已保留', { cause: error }); }
+      this.recoveredFromBackup = true;
+      console.warn('Codex Board 元数据文件缺失，已从备份恢复。');
     }
     // Existing boards predate research projects. Keep all their graph metadata;
     // filesystem folders do not imply a research project or task assignment.
-    if (!this.state.organization) this.state.organization = { projects: [], tasks: [], assignments: {} };
-    this.rolloutCache = new Map();
+    this.rolloutMonitor = new RolloutMonitor();
   }
 
   database() {
@@ -34,50 +113,36 @@ export class BoardStore {
     return this.db;
   }
 
-  rollout(path) {
-    if (!path) return {};
-    try {
-      const stat = statSync(path);
-      const cached = this.rolloutCache.get(path);
-      if (cached && cached.size === stat.size && cached.mtime === stat.mtimeMs) return cached.value;
-      const fd = openSync(path, 'r');
-      let head, tail;
-      try {
-        const headBuffer = Buffer.alloc(Math.min(65536, stat.size));
-        readSync(fd, headBuffer, 0, headBuffer.length, 0);
-        head = headBuffer.toString('utf8');
-        const tailBuffer = Buffer.alloc(Math.min(65536, stat.size));
-        readSync(fd, tailBuffer, 0, tailBuffer.length, Math.max(0, stat.size - tailBuffer.length));
-        tail = tailBuffer.toString('utf8');
-      } finally { closeSync(fd); }
-      const value = {};
-      for (const line of head.split('\n').slice(0, 5)) {
-        try {
-          const entry = JSON.parse(line);
-          if (entry.type === 'session_meta') {
-            value.forkedFromId = entry.payload?.forked_from_id || null;
-            value.gitBranch = entry.payload?.git?.branch || null;
-            break;
-          }
-        } catch {}
-      }
-      for (const line of tail.split('\n').reverse()) {
-        try {
-          const entry = JSON.parse(line);
-          const item = entry.payload;
-          if (entry.type === 'event_msg' && ['user_message', 'agent_message'].includes(item?.type) && typeof item.message === 'string') {
-            value.lastMessage = shorten(item.message);
-            break;
-          }
-          if (entry.type === 'response_item' && item?.type === 'message' && ['user', 'assistant'].includes(item.role)) {
-            const text = (item.content || []).filter(part => typeof part.text === 'string').map(part => part.text).join(' ');
-            if (text) { value.lastMessage = shorten(text); break; }
-          }
-        } catch {}
-      }
-      this.rolloutCache.set(path, { size: stat.size, mtime: stat.mtimeMs, value });
-      return value;
-    } catch { return {}; }
+  rollout(path) { return this.rolloutMonitor.read(path); }
+
+  async replies(id) {
+    if (!UUID.test(id)) throw new Error('对话 ID 格式无效');
+    const row = this.database().prepare('SELECT rollout_path FROM threads WHERE id=?').get(id);
+    if (!row?.rollout_path) throw new Error('找不到这条对话的回复记录');
+    return recentReplies(row.rollout_path);
+  }
+
+  async handoff(thread) {
+    if (!UUID.test(thread.id)) throw new Error('对话 ID 格式无效');
+    const row = this.database().prepare('SELECT rollout_path FROM threads WHERE id=?').get(thread.id);
+    if (!row?.rollout_path) throw new Error('找不到这条对话的历史记录');
+    const [handoff, settings] = await Promise.all([
+      buildHandoff({ rolloutPath: row.rollout_path, thread }),
+      this.threadSettings(thread.id),
+    ]);
+    return { ...handoff, settings };
+  }
+
+  async threadSettings(id) {
+    if (!UUID.test(id)) throw new Error('对话 ID 格式无效');
+    const record = this.database().prepare('SELECT * FROM threads WHERE id=?').get(id);
+    if (!record) throw new Error('找不到来源对话的配置');
+    return readThreadSettings({ rolloutPath: record.rollout_path, record });
+  }
+
+  inheritance(id) {
+    const handoff = this.state.managedThreads[id]?.inheritance;
+    return handoff ? structuredClone(handoff) : null;
   }
 
   threads() {
@@ -86,14 +151,17 @@ export class BoardStore {
     const archivedFilter = this.columns.has('archived') ? 'archived = 0 AND ' : '';
     const placeholders = managedIds.map(() => '?').join(',');
     const rows = db.prepare(`SELECT * FROM threads WHERE ${archivedFilter}(source IN ('cli','vscode','appServer','app-server')${managedIds.length ? ` OR id IN (${placeholders})` : ''})`).all(...managedIds);
+    this.rolloutMonitor.retain(new Set(rows.map(row => row.rollout_path)));
     const threads = rows.map(row => {
       const managed = this.state.managedThreads[row.id] || {};
       const rollout = this.rollout(row.rollout_path);
       const assignment = this.state.organization.assignments[row.id];
+      const inheritedPreview = managed.inheritance?.prompt && rollout.lastMessage === shorten(managed.inheritance.prompt)
+        ? managed.preview : null;
       return {
         id: row.id,
         title: shorten(row.name || managed.title || row.title || row.first_user_message || '未命名对话', 120),
-        preview: rollout.lastMessage || shorten(row.preview || row.first_user_message),
+        preview: inheritedPreview || rollout.lastMessage || shorten(row.preview || row.first_user_message),
         cwd: row.cwd,
         folder: basename(row.cwd) || row.cwd,
         // Retained for older clients; new UI uses folder + organization.
@@ -104,7 +172,10 @@ export class BoardStore {
         updatedAt: timestamp(row.updated_at, row.updated_at_ms),
         createdAt: timestamp(row.created_at, row.created_at_ms),
         forkedFromId: rollout.forkedFromId || managed.forkedFromId || null,
-        status: 'unknown',
+        inheritedFromId: managed.inheritedFromId || null,
+        status: rollout.activity.status,
+        activity: inheritedPreview && rollout.activity.status === 'unknown'
+          ? { ...rollout.activity, reason: '交接上下文已载入，发送下一条消息即可继续。' } : rollout.activity,
         archived: false,
       };
     });
@@ -113,7 +184,13 @@ export class BoardStore {
     return threads.sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
   }
 
-  graph() { return { positions: this.state.positions, edges: this.state.edges }; }
+  graph(validIds) {
+    if (validIds === undefined) return structuredClone({ positions: this.state.positions, edges: this.state.edges });
+    return {
+      positions: Object.fromEntries(Object.entries(this.state.positions).filter(([id]) => validIds.has(id))),
+      edges: this.state.edges.filter(edge => validIds.has(edge.source) && validIds.has(edge.target)).map(edge => ({ ...edge })),
+    };
+  }
 
   organization() { return structuredClone(this.state.organization); }
 
@@ -208,9 +285,46 @@ export class BoardStore {
   }
 
   save(state = this.state) {
-    const temporary = `${this.graphPath}.${process.pid}.tmp`;
-    writeFileSync(temporary, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
-    renameSync(temporary, this.graphPath);
+    const serialized = JSON.stringify(state, null, 2) + '\n';
+    const release = acquireWriteLock(this.lockPath);
+    try {
+      const current = existsSync(this.graphPath) ? readFileSync(this.graphPath, 'utf8') : null;
+      const currentRevision = digest(current);
+      if (currentRevision !== this.revision) {
+        // Reject the stale mutation, but make the same server usable on retry.
+        // Never silently merge a graph or receipt computed from old state.
+        if (current !== null) {
+          try {
+            this.state = parseState(current);
+            this.recoveredFromBackup = false;
+          } catch (error) {
+            if (!existsSync(this.backupPath)) throw new Error('Codex Board 元数据已被外部写坏，且没有可用备份', { cause: error });
+            this.state = parseState(readFileSync(this.backupPath, 'utf8'));
+            this.recoveredFromBackup = true;
+            console.warn('Codex Board 元数据已被外部写坏，已从备份恢复。');
+          }
+        } else if (existsSync(this.backupPath)) {
+          this.state = parseState(readFileSync(this.backupPath, 'utf8'));
+          this.recoveredFromBackup = true;
+        } else throw new Error('Codex Board 元数据已被外部删除，且没有可用备份');
+        this.revision = currentRevision;
+        this.corruptPreservedRevision = null;
+        throw Object.assign(new Error('Codex Board 元数据已被另一实例修改，现已重新载入，请重试'), { status: 409 });
+      }
+      if (current !== null && this.recoveredFromBackup && this.corruptPreservedRevision !== currentRevision) {
+        writeAtomic(`${this.graphPath}.corrupt-${Date.now()}-${randomUUID()}`, current);
+        this.corruptPreservedRevision = currentRevision;
+      }
+      if (current !== null && !this.recoveredFromBackup) writeAtomic(this.backupPath, current);
+      writeAtomic(this.graphPath, serialized);
+      this.revision = digest(serialized);
+      this.recoveredFromBackup = false;
+      this.corruptPreservedRevision = null;
+      if (current === null && !existsSync(this.backupPath)) {
+        try { writeAtomic(this.backupPath, serialized); }
+        catch (error) { console.warn('Codex Board 备份写入失败：', error.message); }
+      }
+    } finally { release(); }
   }
 
   updateGraph(patch, validIds) {
@@ -229,20 +343,57 @@ export class BoardStore {
     if (patch.edges !== undefined) {
       if (!Array.isArray(patch.edges) || patch.edges.length > 10000) throw new Error('连线格式无效');
       const seenIds = new Set(), seenPairs = new Set();
-      nextEdges = patch.edges.map(edge => {
+      const hiddenEdges = this.state.edges.filter(edge => !validIds.has(edge.source) || !validIds.has(edge.target));
+      nextEdges = [...hiddenEdges, ...patch.edges.map(edge => {
         if (!edge || typeof edge.id !== 'string' || edge.id.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(edge.id) || !validIds.has(edge.source) || !validIds.has(edge.target) || edge.source === edge.target || !['serial', 'parallel', 'reference'].includes(edge.type)) throw new Error('连线端点、类型或 ID 无效');
         const pair = `${edge.source}:${edge.target}`;
         if (seenIds.has(edge.id) || seenPairs.has(pair)) throw new Error('连线重复');
         seenIds.add(edge.id); seenPairs.add(pair);
         return { id: edge.id, source: edge.source, target: edge.target, type: edge.type };
-      });
+      })];
     }
-    this.state.positions = nextPositions;
-    this.state.edges = nextEdges;
-    this.save();
-    return this.graph();
+    const nextState = { ...this.state, positions: nextPositions, edges: nextEdges };
+    this.save(nextState);
+    this.state = nextState;
+    return this.graph(validIds);
   }
 
-  remember(thread) { this.state.managedThreads[thread.id] = thread; this.save(); }
+  creationRequest(requestId) {
+    if (typeof requestId !== 'string' || !UUID.test(requestId)) return null;
+    const receipt = this.state.creationRequests[requestId];
+    return receipt ? { fingerprint: receipt.fingerprint, threadId: receipt.threadId } : null;
+  }
+
+  remember(thread, { requestId, fingerprint, assignment } = {}) {
+    if (!thread || typeof thread !== 'object' || !UUID.test(thread.id)) throw new Error('会话元数据无效');
+    if (requestId !== undefined && (!UUID.test(requestId) || typeof fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(fingerprint))) throw new Error('创建请求回执无效');
+    if (requestId === undefined && fingerprint !== undefined) throw new Error('创建请求回执无效');
+    const managedThreads = { ...this.state.managedThreads, [thread.id]: structuredClone(thread) };
+    let creationRequests = this.state.creationRequests;
+    if (requestId !== undefined) {
+      const previous = this.creationRequest(requestId);
+      if (previous && (previous.fingerprint !== fingerprint || previous.threadId !== thread.id)) throw Object.assign(new Error('创建请求 ID 已用于其他会话'), { status: 409 });
+      creationRequests = { ...creationRequests, [requestId]: { fingerprint, threadId: thread.id } };
+      const oldest = Object.keys(creationRequests).slice(0, Math.max(0, Object.keys(creationRequests).length - 1000));
+      for (const id of oldest) delete creationRequests[id];
+    }
+    let organization = this.state.organization;
+    if (assignment !== undefined) {
+      const assignments = { ...organization.assignments };
+      if (assignment === null) delete assignments[thread.id];
+      else {
+        if (!isRecord(assignment) || Object.keys(assignment).some(key => !['projectId', 'taskId'].includes(key)) ||
+          typeof assignment.projectId !== 'string' || !UUID.test(assignment.projectId) ||
+          !organization.projects.some(project => project.id === assignment.projectId) ||
+          (assignment.taskId != null && (typeof assignment.taskId !== 'string' || !UUID.test(assignment.taskId) ||
+            !organization.tasks.some(task => task.id === assignment.taskId && task.projectId === assignment.projectId)))) throw new Error('项目或任务分配无效');
+        assignments[thread.id] = { projectId: assignment.projectId, taskId: assignment.taskId ?? null };
+      }
+      organization = { ...organization, assignments };
+    }
+    const nextState = { ...this.state, managedThreads, creationRequests, organization };
+    this.save(nextState);
+    this.state = nextState;
+  }
   close() { this.db?.close(); }
 }

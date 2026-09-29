@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
-import { rmSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { EditorBridge } from '../server/bridge.mjs';
 import { createServer } from '../server/index.mjs';
 import { makeFixture } from './fixture.mjs';
@@ -33,7 +34,7 @@ test('桥接：等待窗口实际确认，重复点击合并为一个命令', as
 
 test('桥接：不可用窗口超时后不给编辑器堆积重试', async t => {
   const { f, bridge, window } = setup(t, { timeoutMs: 30 });
-  await assert.rejects(bridge.open(f.ids[0], window.id), error => error.status === 504);
+  await assert.rejects(bridge.open(f.ids[0], window.id), error => error.status === 504 && /1 秒/.test(error.message));
   assert.equal(bridge.commands.size, 0);
   assert.throws(() => bridge.open(f.ids[0], window.id), /尚未完成/);
   assert.equal(bridge.clients.get(window.id).queued, null);
@@ -115,4 +116,41 @@ test('真实 HTTP 桥接：未收到编辑器回执前接口不报告成功', as
   const missing = await fetch(base + `/api/threads/${f.ids[1]}/open-vscode`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ windowId: id }) });
   assert.equal(missing.status, 409);
   assert.equal(server.board.bridge.commands.size, 0);
+});
+
+
+test('桥接：回执丢失后重复投递同一个命令 ID，迟到回执不重复完成', async t => {
+  const { f, bridge, window } = setup(t);
+  const opening = bridge.open(f.ids[0], window.id);
+  const first = (await bridge.poll(window.id)).command;
+  const retry = (await bridge.poll(window.id)).command;
+  assert.deepEqual(retry, first);
+  bridge.result({ clientId: window.id, commandId: retry.id, status: 'opened', windowFocused: true });
+  assert.equal((await opening).verified, true);
+  assert.deepEqual(bridge.result({ clientId: window.id, commandId: retry.id, status: 'opened', windowFocused: true }), { ignored: true });
+  assert.equal(bridge.commands.size, 0);
+});
+
+test('桥接：同一窗口新进程注册时结束旧长轮询并允许重新取命令', async t => {
+  const { f, bridge, window } = setup(t);
+  const response = new EventEmitter();
+  const waiting = bridge.poll(window.id, response);
+  assert.equal(response.listenerCount('close'), 1);
+  bridge.register({ ...window, pid: window.pid + 1 });
+  assert.deepEqual(await waiting, { command: null });
+  assert.equal(response.listenerCount('close'), 0);
+  const opening = bridge.open(f.ids[0], window.id);
+  const command = (await bridge.poll(window.id)).command;
+  bridge.result({ clientId: window.id, commandId: command.id, status: 'opened', windowFocused: true });
+  assert.equal((await opening).verified, true);
+  assert.throws(() => bridge.register(null), error => error.status === 400);
+  assert.throws(() => bridge.result(null), error => error.status === 400);
+});
+
+
+test('桥接：损坏或空令牌不能成为有效认证凭证', t => {
+  const f = makeFixture();
+  t.after(() => f.cleanup());
+  writeFileSync(join(f.dataDir, 'bridge-token'), '');
+  assert.throws(() => new EditorBridge({ dataDir: f.dataDir }), /桥接令牌损坏/);
 });

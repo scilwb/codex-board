@@ -17,7 +17,7 @@ export function codexBinary() {
   return 'codex';
 }
 
-/** A local metadata client. This module never submits turn/start or inference. */
+/** Local metadata/history client. Never submits turn/start or inference. */
 export class AppServerClient {
   constructor({ codexHome, binary = codexBinary(), timeoutMs = 45000, idleTimeoutMs = 30000 } = {}) {
     this.codexHome = codexHome;

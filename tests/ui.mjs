@@ -10,6 +10,7 @@ import { makeFixture } from './fixture.mjs';
 const fixture = makeFixture();
 const opened = [];
 const appServer = { async request(method, params) {
+  if (method === 'thread/settings/update') return {};
   if (method === 'thread/unsubscribe') return {};
   if (method === 'thread/name/set') {
     fixture.db.prepare('UPDATE threads SET name=? WHERE id=?').run(params.name, params.threadId);

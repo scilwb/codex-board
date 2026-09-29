@@ -12,6 +12,7 @@ export class EditorBridge {
     if (!existsSync(path)) writeFileSync(path, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' });
     chmodSync(path, 0o600);
     this.token = readFileSync(path, 'utf8').trim();
+    if (!/^[0-9a-f]{64}$/i.test(this.token)) throw new Error('Codex Board 桥接令牌损坏，请修复 bridge-token 文件后重启');
     this.timeoutMs = timeoutMs;
     this.staleMs = staleMs;
     this.pollMs = pollMs;
@@ -26,11 +27,16 @@ export class EditorBridge {
   }
 
   register(body) {
-    if (!UUID.test(body.id) || !Number.isSafeInteger(body.pid) || body.pid < 1 || typeof body.title !== 'string' || body.title.length > 300 ||
+    if (!body || typeof body !== 'object' || !UUID.test(body.id) || !Number.isSafeInteger(body.pid) || body.pid < 1 || typeof body.title !== 'string' || body.title.length > 300 ||
       !Array.isArray(body.folders) || body.folders.length > 100 || body.folders.some(path => typeof path !== 'string' || !path.startsWith('/') || path.length > 4096) ||
       !Array.isArray(body.openThreads) || body.openThreads.length > 1000 || body.openThreads.some(id => !UUID.test(id)) ||
       (body.activeThreadId != null && !UUID.test(body.activeThreadId))) throw failure('VS Code 连接信息无效');
     const previous = this.clients.get(body.id);
+    if (previous && previous.pid !== body.pid) {
+      previous.waiter?.(null);
+      previous.cooldownUntil = 0;
+      if (previous.pending && this.commands.has(previous.pending.id)) previous.queued = { id: previous.pending.id, threadId: previous.pending.threadId };
+    }
     this.clients.set(body.id, Object.assign(previous || {}, { id: body.id, title: body.title, pid: body.pid, folders: [...body.folders],
       openThreads: [...new Set(body.openThreads)], activeThreadId: body.activeThreadId || null, seenAt: Date.now() }));
   }
@@ -49,11 +55,15 @@ export class EditorBridge {
     if (!client) throw failure('请重新连接 Codex Board', 404);
     client.seenAt = Date.now();
     const take = () => {
-      const command = client.queued;
+      // A result POST may be lost after VS Code handled a command. Redeliver the
+      // same ID on its next poll; the extension caches completed command IDs.
+      const command = client.queued || (client.pending && this.commands.has(client.pending.id)
+        ? { id: client.pending.id, threadId: client.pending.threadId } : null);
       client.queued = null;
       return command && this.commands.has(command.id) ? command : null;
     };
-    if (client.queued) return { command: take() };
+    if (client.queued || client.pending) return { command: take() };
+    if (response?.destroyed || response?.writableEnded) return { command: null };
     client.waiter?.(null);
     return new Promise(resolve => {
       let timer;
@@ -72,6 +82,7 @@ export class EditorBridge {
   }
 
   open(threadId, windowId) {
+    if (!UUID.test(threadId)) throw failure('对话 ID 格式无效');
     const windows = this.windows();
     let client = windowId ? this.clients.get(windowId) : null;
     if (windowId && !windows.some(window => window.id === windowId)) throw failure('这个 VS Code 窗口未连接，请重新选择窗口', 409);
@@ -95,7 +106,7 @@ export class EditorBridge {
       if (client.pending === pending) client.pending = null;
       if (client.queued?.id === id) client.queued = null;
       client.cooldownUntil = Date.now() + 15000;
-      reject(failure('VS Code 未在 12 秒内确认。可能仍在加载或扩展无响应，请先查看 VS Code；没有自动重试。', 504));
+      reject(failure(`VS Code 未在 ${Math.ceil(this.timeoutMs / 1000)} 秒内确认。可能仍在加载或扩展无响应，请先查看 VS Code；没有自动重试。`, 504));
     }, this.timeoutMs);
     client.pending = pending;
     this.commands.set(id, pending);
@@ -106,7 +117,7 @@ export class EditorBridge {
   }
 
   result(body) {
-    if (!UUID.test(body.clientId) || !UUID.test(body.commandId) || !['opened', 'error'].includes(body.status) ||
+    if (!body || typeof body !== 'object' || !UUID.test(body.clientId) || !UUID.test(body.commandId) || !['opened', 'error'].includes(body.status) ||
       (body.message != null && (typeof body.message !== 'string' || body.message.length > 1000))) throw failure('窗口响应格式无效');
     const pending = this.commands.get(body.commandId);
     if (!pending) return { ignored: true };
