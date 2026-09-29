@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { RolloutMonitor, recentReplies } from './activity.mjs';
 import { buildHandoff } from './handoff.mjs';
 import { readThreadSettings } from './thread-settings.mjs';
+import { readPublicHistory } from './public-history.mjs';
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const shorten = (value, limit = 240) => typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, limit) : '';
@@ -120,6 +121,13 @@ export class BoardStore {
     const row = this.database().prepare('SELECT rollout_path FROM threads WHERE id=?').get(id);
     if (!row?.rollout_path) throw new Error('找不到这条对话的回复记录');
     return recentReplies(row.rollout_path);
+  }
+
+  async publicHistory(id, offset) {
+    if (!UUID.test(id)) throw new Error('对话 ID 格式无效');
+    const row = this.database().prepare('SELECT rollout_path FROM threads WHERE id=?').get(id);
+    if (!row?.rollout_path) throw new Error('找不到这条对话的历史记录');
+    return readPublicHistory({ rolloutPath: row.rollout_path, offset });
   }
 
   async handoff(thread) {

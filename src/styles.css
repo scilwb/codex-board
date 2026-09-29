@@ -237,7 +237,16 @@ button { color: inherit; }
 .handoff-label .field-label { margin: 0; }
 .handoff-label > span { font-size: 10px; color: #91a08d; white-space: nowrap; }
 .handoff-editor .field-note { margin: 7px 0 9px; }
-.handoff-textarea { display: block; width: 100%; height: 215px; min-height: 135px; max-height: 40vh; resize: vertical; line-height: 1.7; font-family: inherit; overflow-wrap: anywhere; }
+.handoff-textarea { display: block; width: 100%; height: 280px; min-height: 160px; max-height: 45vh; resize: vertical; line-height: 1.7; font-family: inherit; overflow-wrap: anywhere; }
+.handoff-coverage { margin: 0 0 10px; }
+.handoff-files { border: 1px solid #dfe8df; border-radius: 6px; padding: 8px 10px; background: #f8faf7; font-size: 10px; color: #687d60; }
+.handoff-files summary { cursor: pointer; line-height: 1.7; }
+.handoff-files-hint { margin-left: 9px; color: #8e9d86; }
+.handoff-files ul { list-style: none; margin: 8px 0 0; padding: 0; max-height: 170px; overflow: auto; scrollbar-width: thin; }
+.handoff-files li { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; border-top: 1px solid #e8eee4; }
+.handoff-files code { flex: 1; min-width: 0; font: inherit; overflow-wrap: anywhere; }
+.handoff-file-status { flex-shrink: 0; color: #608361; }
+.handoff-file-status.is-unverified { color: #9a7d4b; }
 textarea:focus-visible { outline: 2px solid #87ad99; outline-offset: 3px; }
 textarea:disabled { opacity: .65; background: #f7f9f5; }
 .handoff-loading { display: flex; align-items: center; gap: 7px; font-size: 11px; color: #829478; margin: 10px 0; }
@@ -247,7 +256,7 @@ textarea:disabled { opacity: .65; background: #f7f9f5; }
 .handoff-retry { display: block; border: 0; background: none; color: inherit; font-size: 10px; text-decoration: underline; padding: 5px 0 0; }
 .inheritance-context { margin: 14px 0; }
 .inheritance-prompt { margin: 8px 0 0; padding: 10px; max-height: 280px; overflow: auto; border: 1px solid #e0e8dc; border-radius: 6px; background: #f8faf6; color: #64765c; font-family: inherit; font-size: 11px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; scrollbar-width: thin; }
-@media (max-width: 730px) { .inherit-modal { padding: 20px; } .handoff-textarea { height: 180px; } }
+@media (max-width: 730px) { .inherit-modal { padding: 20px; } .handoff-textarea { height: 230px; } }
 
 .inherit-settings { margin: 16px 0 0; padding: 11px 13px; border: 1px solid #dfe8df; border-radius: 7px; background: #f7faf6; }
 .inherit-settings h3 { margin: 0 0 8px; color: #66805e; font-size: 11px; font-weight: 550; }

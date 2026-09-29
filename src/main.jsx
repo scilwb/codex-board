@@ -15,6 +15,7 @@ import { activityPresentation, createActivityTracker } from './activity.js';
 import './styles.css';
 
 const RELATIONS = { serial: '串行', parallel: '并行', reference: '参考' };
+const HANDOFF_PROMPT_LIMIT = 24_000;
 const emptyGraph = { positions: {}, edges: [] };
 const emptyOrganization = { projects: [], tasks: [], assignments: {} };
 
@@ -740,6 +741,19 @@ function OrganizationModal({ initial, organization, onClose, onSave }) {
   </section></div>;
 }
 
+function HandoffCoverage({ handoff }) {
+  const { coverage, files } = handoff;
+  const hasCoverage = coverage && [coverage.bytesRead, coverage.totalBytes, coverage.messageCount].every((value) => Number.isFinite(value) && value >= 0);
+  const paths = Array.isArray(files) ? files.filter((file) => typeof file?.path === 'string' && file.path) : null;
+  const formatBytes = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  const statuses = { file: '文件存在', directory: '目录存在', missing: '未找到', unverified: '未核验' };
+  if (!hasCoverage && !paths) return null;
+  return <div className="handoff-coverage">
+    {hasCoverage && <p className="handoff-note" data-testid="inherit-coverage">已扫描 {coverage.messageCount} 条公开消息，读取 {formatBytes(coverage.bytesRead)} / {formatBytes(coverage.totalBytes)}。{coverage.sampled && ` 分段读取${Number.isInteger(coverage.windowCount) && coverage.windowCount > 0 ? `（${coverage.windowCount} 处）` : ''}，未读取内容可能遗漏。`}</p>}
+    {paths && (paths.length ? <details className="handoff-files" data-testid="inherit-files"><summary><span data-testid="inherit-file-count">关键路径 · {paths.length} 项</span><span className="handoff-files-hint">查看清单</span></summary><ul>{paths.map((file, index) => <li key={`${file.path}:${file.line || ''}:${index}`}><code>{file.path}{Number.isInteger(file.line) && file.line > 0 ? `:${file.line}` : ''}</code><span className={`handoff-file-status ${['missing', 'unverified'].includes(file.status) ? 'is-unverified' : ''}`}>{statuses[file.status] || statuses.unverified}</span></li>)}</ul><p className="handoff-note">路径来自公开记录，存在性按生成时结果显示。</p></details> : <p className="handoff-note" data-testid="inherit-file-count">未提取到关键路径，请补充需要保留的文件或目录。</p>)}
+  </div>;
+}
+
 function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
   const isInherit = modal.kind === 'inherit';
   const [title, setTitle] = useState(modal.title);
@@ -754,6 +768,7 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
   const submitBusy = useRef(false);
   const creationRequest = useRef(null);
   const sourceId = modal.thread?.id;
+  const maxPromptLength = handoff.maxPromptLength || HANDOFF_PROMPT_LIMIT;
 
   const loadHandoff = useCallback(async () => {
     if (!isInherit || !sourceId) return;
@@ -767,8 +782,9 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
       const result = await api(`/api/threads/${encodeURIComponent(sourceId)}/handoff`, { signal: controller.signal });
       if (handoffRequest.current !== controller || controller.signal.aborted) return;
       const text = typeof result.prompt === 'string' ? result.prompt : '';
-      setPrompt(text.slice(0, 12000));
-      setHandoff({ loading: false, loaded: true, error: '', truncated: !!result.truncated || text.length > 12000, messageCount: Number(result.messageCount) || 0, settings: result.settings });
+      const limit = Number.isInteger(result.maxPromptLength) && result.maxPromptLength > 0 ? Math.min(result.maxPromptLength, HANDOFF_PROMPT_LIMIT) : HANDOFF_PROMPT_LIMIT;
+      setPrompt(text.slice(0, limit));
+      setHandoff({ loading: false, loaded: true, error: '', truncated: !!result.truncated || text.length > limit, messageCount: Number(result.messageCount) || 0, settings: result.settings, maxPromptLength: limit, version: result.version, coverage: result.coverage, files: result.files });
     } catch (err) {
       if (handoffRequest.current === controller && (!controller.signal.aborted || timedOut)) setHandoff((current) => ({ ...current, loading: false, error: timedOut ? '读取超时，请重试。' : err.message }));
     } finally { clearTimeout(timeout); }
@@ -789,7 +805,7 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
     if (submitBusy.current) return;
     if (!cwd.trim()) { setError('请选择或填写文件夹。'); return; }
     if (isInherit && (!handoff.loaded || handoff.loading)) { setError('请先读取交接提示词。'); return; }
-    if (isInherit && (!prompt.trim() || prompt.length > 12000)) { setError('交接提示词不能为空，且最多 12000 字符。'); return; }
+    if (isInherit && (!prompt.trim() || prompt.length > maxPromptLength)) { setError(`交接提示词不能为空，且最多 ${maxPromptLength} 字符。`); return; }
     submitBusy.current = true;
     setSubmitting(true); setError('');
     const assignment = { projectId: projectId || null, taskId: taskId || null };
@@ -809,7 +825,7 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
     // editor failure must never re-enable this POST or create another thread.
     await onCreated(result.thread, assignment, modal.kind);
   }
-  const blocked = submitting || (isInherit && (!handoff.loaded || handoff.loading || !prompt.trim() || prompt.length > 12000));
+  const blocked = submitting || (isInherit && (!handoff.loaded || handoff.loading || !prompt.trim() || prompt.length > maxPromptLength));
   const actionIcon = modal.kind === 'fork' ? <GitFork size={14} /> : isInherit ? <ArrowRightToLine size={14} /> : <Plus size={14} />;
   return <div className="modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget && !submitBusy.current) onClose(); }}><section className={`modal ${isInherit ? 'inherit-modal' : ''}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" data-testid="thread-modal">
     <div className="modal-heading"><span className="modal-icon">{modal.kind === 'fork' ? <GitFork size={21} /> : isInherit ? <ArrowRightToLine size={21} /> : <Plus size={21} />}</span><button className="icon-button" onClick={onClose} disabled={submitting} aria-label="关闭窗口"><X size={18} /></button></div>
@@ -822,13 +838,14 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
       <label className="field-label" htmlFor="thread-cwd">文件夹</label><input className="form-input path-input" id="thread-cwd" data-testid="modal-cwd" list="workspace-paths" value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/home/…/your-project" required disabled={submitting} /><datalist id="workspace-paths">{[...new Set(folders.map((item) => item.cwd).filter(Boolean))].map((path) => <option value={path} key={path} />)}</datalist>
       <div className="modal-assignment"><div><label className="field-label" htmlFor="modal-project">项目</label><select id="modal-project" className="form-input" data-testid="modal-project" value={projectId} disabled={submitting} onChange={(event) => { setProjectId(event.target.value); setTaskId(''); }}><option value="">未归类</option>{organization.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div><div><label className="field-label" htmlFor="modal-task">任务</label><select id="modal-task" className="form-input" data-testid="modal-task" value={taskId} disabled={submitting || !projectId} onChange={(event) => setTaskId(event.target.value)}><option value="">未指定任务</option>{organization.tasks.filter((task) => task.projectId === projectId).map((task) => <option key={task.id} value={task.id}>{task.name}</option>)}</select></div></div>
       {isInherit && handoff.loaded && <InheritedSettings settings={handoff.settings} />}
-      {isInherit && <section className="handoff-editor"><div className="handoff-label"><label className="field-label" htmlFor="inherit-prompt">交接提示词</label><span data-testid="inherit-prompt-count">{prompt.length} / 12000</span></div><p className="field-note" id="inherit-prompt-help">下方包含最近公开消息摘录。请补充目标、已有决定和待办，让新对话了解接下来要做什么。</p>
+      {isInherit && <section className="handoff-editor"><div className="handoff-label"><label className="field-label" htmlFor="inherit-prompt">交接提示词</label><span data-testid="inherit-prompt-count">{prompt.length} / {maxPromptLength}</span></div><p className="field-note" id="inherit-prompt-help">{handoff.loaded && handoff.version !== 2 ? '下方为公开消息摘录，可补充目标、关键路径、已完成、待办和验证线索。' : '结构化交接，含关键路径、已完成、待办和验证线索；未记录项需补齐。'}请检查并编辑后继续。</p>
         {handoff.loading && <p className="handoff-loading" role="status" data-testid="inherit-loading"><LoaderCircle size={14} className="spin" />正在读取交接内容…</p>}
         {handoff.error && <div className="form-error" role="alert" data-testid="inherit-error">{handoff.error}<button className="handoff-retry" type="button" onClick={loadHandoff} disabled={submitting} data-testid="inherit-retry">重新读取</button></div>}
-        <textarea id="inherit-prompt" className="form-input handoff-textarea" data-testid="inherit-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} disabled={submitting || handoff.loading || !handoff.loaded} maxLength={12000} rows={9} aria-describedby="inherit-prompt-help" placeholder="目标：
+        {handoff.loaded && <HandoffCoverage handoff={handoff} />}
+        <textarea id="inherit-prompt" className="form-input handoff-textarea" data-testid="inherit-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} disabled={submitting || handoff.loading || !handoff.loaded} maxLength={maxPromptLength} rows={14} aria-describedby="inherit-prompt-help" placeholder="目标：
 已有决定：
 下一步待办：" />
-        {handoff.loaded && <p className={`handoff-note ${handoff.truncated ? 'is-truncated' : ''}`} data-testid="inherit-note">{handoff.messageCount ? `已读取 ${handoff.messageCount} 条公开消息。` : '暂无可用公开消息，可自行补写交接提示词。'}{handoff.truncated && ' 内容已截取，请补齐需要保留的信息。'}</p>}
+        {handoff.loaded && <p className={`handoff-note ${handoff.truncated ? 'is-truncated' : ''}`} data-testid="inherit-note">{handoff.messageCount ? `${handoff.version === 2 ? '交接内容选入' : '已读取'} ${handoff.messageCount} 条公开消息。` : '暂无可用公开消息，可自行补写交接提示词。'}{handoff.truncated && ' 内容已截取，请补齐需要保留的信息。'}</p>}
       </section>}
       {error && <p className="form-error" role="alert" data-testid="modal-error">{error}</p>}
       <div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={submitting} data-testid="modal-cancel">取消</button><button type="submit" className="primary-button" disabled={blocked} data-testid="modal-submit">{submitting ? <LoaderCircle className="spin" size={14} /> : actionIcon}{submitting ? '正在创建…' : modal.kind === 'fork' ? '创建 Fork' : isInherit ? '继承并打开' : '创建对话'}</button></div>

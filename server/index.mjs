@@ -8,6 +8,7 @@ import { BoardStore, UUID } from './store.mjs';
 import { AppServerClient } from './app-server.mjs';
 import { EditorBridge } from './bridge.mjs';
 import { GitBranches } from './git.mjs';
+import { HANDOFF_PROMPT_LIMIT } from './handoff.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const MAX_BODY = 1024 * 1024;
@@ -166,7 +167,7 @@ export function createServer(options = {}) {
     const cwd = validCwd(body.cwd || parent?.cwd);
     const title = validTitle(body.title, parent ? `${parent.title.slice(0, 100)} · ${inheriting ? '续聊' : 'Fork'}` : '新对话');
     const prompt = inheriting ? body.prompt : null;
-    if (inheriting && (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 12000 || prompt.includes('\0'))) throw fail('交接提示词须为 1 到 12000 个字符');
+    if (inheriting && (typeof prompt !== 'string' || !prompt.trim() || prompt.length > HANDOFF_PROMPT_LIMIT || prompt.includes('\0'))) throw fail(`交接提示词须为 1 到 ${HANDOFF_PROMPT_LIMIT} 个字符`);
     const organization = store.organization();
     const assignment = Object.hasOwn(body, 'projectId')
       ? { projectId: body.projectId, taskId: body.taskId || null }
@@ -298,6 +299,17 @@ export function createServer(options = {}) {
         replyReads++;
         try { return json(response, 200, await store.replies(thread.id)); }
         catch (error) { throw fail(error.code === 'ENOENT' ? '这条对话的回复文件不在本机。' : '回复暂时无法读取，请稍后重试。', 503); }
+        finally { replyReads--; }
+      }
+      const historyMatch = pathname.match(/^\/api\/threads\/([^/]+)\/history$/);
+      if (request.method === 'GET' && historyMatch) {
+        const thread = findThread(historyMatch[1]);
+        const offset = url.searchParams.get('offset') ?? '0';
+        if (!/^\d+$/.test(offset) || !Number.isSafeInteger(Number(offset))) throw fail('历史记录字节偏移无效');
+        if (replyReads >= 2) throw fail('正在读取其他对话，请稍后重试。', 429);
+        replyReads++;
+        try { return json(response, 200, await store.publicHistory(thread.id, Number(offset))); }
+        catch (error) { throw fail(error.code === 'ENOENT' ? '这条对话的历史文件不在本机。' : error.message || '历史暂时无法读取。', error.status || 503); }
         finally { replyReads--; }
       }
       const handoffMatch = pathname.match(/^\/api\/threads\/([^/]+)\/handoff$/);

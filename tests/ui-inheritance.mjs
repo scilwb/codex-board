@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { chromium } from 'playwright';
 import { expect } from '@playwright/test';
 import { createServer } from '../server/index.mjs';
@@ -15,6 +16,13 @@ const errors = [];
 const results = [];
 const pathFor = id => fixture.db.prepare('SELECT rollout_path FROM threads WHERE id=?').get(id)?.rollout_path;
 const sourceId = fixture.ids[0];
+const criticalPath = join(fixture.cwd, 'src', 'camera-controller.js');
+const missingPath = join(fixture.cwd, 'output', 'pending-report.json');
+mkdirSync(dirname(criticalPath), { recursive: true });
+writeFileSync(criticalPath, '// Fictional fixture for handoff path verification.\nexport const intervalMs = 20;\nexport const synchronized = true;\n');
+appendFileSync(pathFor(sourceId), JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: {
+  type: 'user_message', message: `目标：完成双相机时间戳验证。关键文件 [camera-controller.js](${criticalPath}:3)，代码目录 \`${dirname(criticalPath)}\`。已完成采样间隔调整；待办：检查同步误差，将验证结果保存至 \`${missingPath}\`。`,
+} }) + '\n');
 const sourceSettings = { model: 'gpt-6-astra', modelProvider: 'openai', reasoningEffort: 'ultra', collaborationMode: 'default' };
 appendFileSync(pathFor(sourceId), JSON.stringify({ timestamp: new Date().toISOString(), type: 'turn_context', payload: {
   model: sourceSettings.model, effort: sourceSettings.reasoningEffort,
@@ -90,7 +98,8 @@ let handoffRequests = 0;
 let inheritanceRequests = 0;
 let firstCreatedId;
 const editedTitle = '相机验证 · 接续实验';
-const editedPrompt = '目标：完成双相机时间戳验证。\n已有决定：使用方案 B，保持当前标定参数。\n下一步待办：检查采样间隔，整理验证结果。';
+const promptLimit = 24_000;
+const editedPrompt = (`目标：完成双相机时间戳验证。\n已有决定：使用方案 B，保持当前标定参数。\n关键路径：${criticalPath}:3\n下一步待办：检查采样间隔，整理验证结果。\n` + '补充验证记录：保留虚构采样结果，逐项确认时间戳和误差。\n'.repeat(1000)).slice(0, promptLimit - 1) + '。';
 const starts = () => calls.filter(call => call.method === 'thread/start').length;
 const selectThread = async id => {
   await page.getByTestId('project-all').click();
@@ -118,7 +127,7 @@ try {
     if (request.method() === 'POST' && request.url().endsWith('/inherit')) inheritBodies.push(request.postDataJSON());
   });
   await page.goto(base);
-  await check('继承入口按需读取公开摘录，继承目录与分类并允许编辑', async () => {
+  await check('继承入口按需读取结构化交接与关键路径，沿用配置并支持 24000 字符编辑', async () => {
     await expect(page.getByTestId('thread-list').locator('button')).toHaveCount(3);
     assert.equal(handoffRequests, 0);
     assert.equal(inheritanceRequests, 0);
@@ -144,11 +153,23 @@ try {
     await expect(page.getByTestId('inherit-settings-plan-note')).toHaveCount(0);
     await expect(page.getByTestId('inherit-settings').locator('input, select, textarea')).toHaveCount(0);
     assert.ok((await page.getByTestId('inherit-prompt').inputValue()).includes(`请处理${fixture.names[0]}`));
+    assert.ok((await page.getByTestId('inherit-prompt').inputValue()).includes(criticalPath));
+    await expect(page.getByTestId('inherit-prompt')).toHaveAttribute('maxlength', String(promptLimit));
+    await expect(page.getByTestId('inherit-prompt')).toHaveAttribute('rows', '14');
+    await expect(page.getByTestId('inherit-coverage')).toContainText('公开消息');
+    await expect(page.getByTestId('inherit-note')).toContainText('交接内容选入');
+    await expect(page.getByTestId('inherit-files')).not.toHaveAttribute('open');
+    await page.getByTestId('inherit-files').locator('summary').click();
+    await expect(page.getByTestId('inherit-files').locator('li').filter({ hasText: criticalPath })).toContainText('文件存在');
+    await expect(page.getByTestId('inherit-files').locator('li').filter({ hasText: missingPath })).toContainText('未找到');
+    await page.getByTestId('inherit-files').locator('summary').click();
     assert.equal(handoffRequests, 1);
     assert.equal(calls.length, 0);
     await page.getByTestId('modal-title').fill(editedTitle);
     await page.getByTestId('inherit-prompt').fill(editedPrompt);
-    await expect(page.getByTestId('inherit-prompt-count')).toHaveText(`${editedPrompt.length} / 12000`);
+    assert.equal(editedPrompt.length, promptLimit);
+    await expect(page.getByTestId('inherit-prompt-count')).toHaveText(`${promptLimit} / ${promptLimit}`);
+    await expect(page.getByTestId('modal-submit')).toBeEnabled();
     await expect(page.getByTestId('thread-modal')).toContainText('发送下一条消息即可继续');
     await page.screenshot({ path: 'artifacts/ui-inheritance-modal.png', fullPage: true });
   });
@@ -182,6 +203,7 @@ try {
     assert.equal(created.inheritedFromId, sourceId);
     assert.deepEqual(server.board.store.organization().assignments[firstCreatedId], { projectId: project.id, taskId: task.id });
     assert.equal(server.board.store.inheritance(firstCreatedId).prompt, editedPrompt);
+    assert.equal(server.board.store.inheritance(firstCreatedId).prompt.length, promptLimit);
     assert.deepEqual(server.board.store.inheritance(firstCreatedId).settings, sourceSettings);
     assert.equal(calls.filter(call => call.method === 'thread/settings/update').length, 2);
     assert.deepEqual(Object.keys(inheritBodies.at(-1)).sort(), ['cwd', 'projectId', 'prompt', 'requestId', 'taskId', 'title']);
@@ -313,8 +335,64 @@ try {
     await expect(page.getByTestId('inherit-settings-plan-note')).toHaveText('已保存计划模式；打开 VS Code 后请核对计划开关。');
     await page.unroute(url);
   });
-  await check('窄屏弹窗可编辑取消，空提示禁提交，没有模型调用或浏览器错误', async () => {
+  await check('超长预览按接口上限截取，超限编辑禁止提交，旧版交接数据仍可读取', async () => {
+    await page.getByTestId('modal-cancel').click();
+    const url = `${base}/api/threads/${sourceId}/handoff`;
+    let mode = 'over-limit';
+    await page.route(url, async route => {
+      const response = await route.fetch();
+      const original = await response.json();
+      let data;
+      if (mode === 'legacy') {
+        const { maxPromptLength, version, coverage, files, ...legacy } = original;
+        data = { ...legacy, prompt: '旧版公开消息摘录，可继续编辑。', truncated: false };
+      } else {
+        data = { ...original, maxPromptLength: mode === 'lower-limit' ? 12000 : promptLimit, prompt: '长'.repeat(promptLimit + 1), truncated: false,
+          coverage: { bytesRead: 1024, totalBytes: 4096, sampled: true, windowCount: 3, messageCount: 12 } };
+      }
+      await route.fulfill({ response, json: data });
+    });
+    await selectThread(sourceId);
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    assert.equal((await page.getByTestId('inherit-prompt').inputValue()).length, promptLimit);
+    await expect(page.getByTestId('inherit-note')).toContainText('内容已截取');
+    await expect(page.getByTestId('inherit-coverage')).toContainText('分段读取（3 处），未读取内容可能遗漏');
+    await expect(page.getByTestId('inherit-coverage')).toContainText('1.0 KB / 4.0 KB');
+    await page.getByTestId('inherit-prompt').evaluate(element => element.removeAttribute('maxlength'));
+    await page.getByTestId('inherit-prompt').fill('长'.repeat(promptLimit + 1));
+    await expect(page.getByTestId('modal-submit')).toBeDisabled();
+    const before = starts();
+    await page.getByTestId('thread-modal').locator('form').evaluate(form => form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+    await expect(page.getByTestId('modal-error')).toContainText(`最多 ${promptLimit} 字符`);
+    assert.equal(starts(), before);
+    await page.getByTestId('modal-cancel').click();
+
+    mode = 'lower-limit';
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    await expect(page.getByTestId('inherit-prompt')).toHaveAttribute('maxlength', '12000');
+    await expect(page.getByTestId('inherit-prompt-count')).toHaveText('12000 / 12000');
+    await expect(page.getByTestId('inherit-note')).toContainText('内容已截取');
+    await page.getByTestId('modal-cancel').click();
+
+    mode = 'legacy';
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toHaveValue('旧版公开消息摘录，可继续编辑。');
+    await expect(page.getByTestId('inherit-prompt')).toHaveAttribute('maxlength', String(promptLimit));
+    await expect(page.getByTestId('inherit-coverage')).toHaveCount(0);
+    await expect(page.getByTestId('inherit-files')).toHaveCount(0);
+    await expect(page.getByTestId('inherit-note')).toContainText('已读取');
+    await expect(page.getByTestId('inherit-settings-model')).toHaveText(sourceSettings.model);
+    await page.unroute(url);
+  });
+  await check('窄屏弹窗与长路径清单可操作，空提示禁提交，没有模型调用或浏览器错误', async () => {
+    await page.getByTestId('modal-cancel').click();
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
     await page.setViewportSize({ width: 600, height: 800 });
+    await page.getByTestId('inherit-files').locator('summary').click();
+    await expect(page.getByTestId('inherit-files')).toContainText(criticalPath);
     await page.getByTestId('inherit-prompt').fill('');
     await expect(page.getByTestId('modal-submit')).toBeDisabled();
     await page.getByTestId('inherit-prompt').fill('目标：继续虚构实验。');

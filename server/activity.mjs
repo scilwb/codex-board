@@ -19,10 +19,10 @@ function userTextParts(item) {
 // Codex also records automatic context in user-role response items. Strip a
 // complete leading wrapper before treating the remainder as a user request.
 // An incomplete wrapper is ambiguous, so do not display any of its contents.
-function publicUserText(text) {
+export function publicUserText(text) {
   let remaining = text.trim();
-  if (/^#\s*AGENTS\.md instructions for\b/i.test(remaining)) return null;
   for (;;) {
+    if (/^#\s*AGENTS\.md instructions for\b/i.test(remaining)) return null;
     const match = remaining.match(/^<(environment_context|permissions instructions|skills_instructions|recommended_plugins)>/i);
     if (!match) break;
     const close = '</' + match[1] + '>';

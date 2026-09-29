@@ -6,6 +6,7 @@ import { appendFileSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs
 import { createServer } from '../server/index.mjs';
 import { BoardStore } from '../server/store.mjs';
 import { makeFixture } from './fixture.mjs';
+import { HANDOFF_PROMPT_LIMIT } from '../server/handoff.mjs';
 
 async function setup(t, options = {}) {
   const fixture = makeFixture();
@@ -71,7 +72,10 @@ test('继承预览按需读取公开片段，隐藏或缺失历史不泄漏，�
   assert.equal(preview.body.source.id, id);
   assert.ok(preview.body.prompt.includes(`请处理${fixture.names[0]}`));
   assert.ok(preview.body.prompt.includes(fixture.names[0] + '已有进展'));
-  assert.ok(preview.body.prompt.length <= 12000);
+  assert.ok(preview.body.prompt.length <= HANDOFF_PROMPT_LIMIT);
+  assert.equal(preview.body.maxPromptLength, HANDOFF_PROMPT_LIMIT);
+  assert.equal(preview.body.version, 2);
+  assert.ok(Array.isArray(preview.body.files));
   assert.equal(readFileSync(pathFor(id), 'utf8'), before);
   assert.deepEqual(calls, []);
   assert.equal((await request('/api/threads/44444444-4444-4444-8444-444444444444/handoff')).status, 404);
@@ -79,6 +83,32 @@ test('继承预览按需读取公开片段，隐藏或缺失历史不泄漏，�
   assert.equal((await request('/api/threads/bad/handoff')).status, 400);
   unlinkSync(pathFor(id));
   assert.equal((await request(`/api/threads/${id}/handoff`)).status, 503);
+});
+
+test('交接中的来源字节可通过只读接口准确找回公开消息，拒绝隐藏会话和非法偏移', async t => {
+  const { fixture, request, calls, pathFor } = await setup(t);
+  const id = fixture.ids[0];
+  const path = pathFor(id);
+  appendFileSync(path, JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant', phase: 'analysis', content: [{ type: 'output_text', text: 'HISTORY_PRIVATE_ANALYSIS' }] } }) + '\n');
+  const before = readFileSync(path, 'utf8');
+  const preview = (await request(`/api/threads/${id}/handoff`)).body;
+  const offsets = [...preview.prompt.matchAll(/来源字节 (\d+) · 记录长度 (\d+)/g)];
+  assert.ok(offsets.length > 0);
+  for (const [, offset, byteLength] of offsets) {
+    const history = await request(`/api/threads/${id}/history?offset=${offset}`);
+    assert.equal(history.status, 200);
+    assert.equal(history.body.messages[0].offset, Number(offset));
+    assert.equal(history.body.messages[0].byteLength, Number(byteLength));
+    assert.ok(!JSON.stringify(history.body).includes('HISTORY_PRIVATE_ANALYSIS'));
+  }
+  for (const offset of ['-1', 'abc', '1.5', '1e4', '9007199254740992', String(Buffer.byteLength(before) + 1)]) {
+    assert.equal((await request(`/api/threads/${id}/history?offset=${offset}`)).status, 400);
+  }
+  assert.equal((await request('/api/threads/bad/history')).status, 400);
+  assert.equal((await request('/api/threads/44444444-4444-4444-8444-444444444444/history')).status, 404);
+  assert.equal((await request('/api/threads/55555555-5555-4555-8555-555555555555/history')).status, 404);
+  assert.deepEqual(calls, []);
+  assert.equal(readFileSync(path, 'utf8'), before);
 });
 
 test('继承创建独立ID和短提示上下文，沿用分类，来源持久化且快照不携带提示全文', async t => {
@@ -121,7 +151,7 @@ test('继承创建独立ID和短提示上下文，沿用分类，来源持久化
 test('继承校验在创建前完成，允许显式清空项目与任务', async t => {
   const { fixture, request, calls } = await setup(t);
   const url = `/api/threads/${fixture.ids[0]}/inherit`;
-  for (const prompt of ['', '   ', null, 3, 'a'.repeat(12001), 'invalid\0text']) {
+  for (const prompt of ['', '   ', null, 3, 'a'.repeat(HANDOFF_PROMPT_LIMIT + 1), 'invalid\0text']) {
     assert.equal((await request(url, 'POST', { prompt })).status, 400);
   }
   assert.equal((await request(url, 'POST', { prompt: '继续', cwd: '/no-such-inheritance-dir' })).status, 400);

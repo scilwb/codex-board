@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildHandoff, HANDOFF_PROMPT_LIMIT } from '../server/handoff.mjs';
+import { buildHandoff, HANDOFF_PROMPT_LIMIT, HANDOFF_READ_LIMIT } from '../server/handoff.mjs';
 
 const thread = { id: '11111111-1111-4111-8111-111111111111', title: '夹爪调试', cwd: '/tmp/gripper' };
 const line = (type, payload) => JSON.stringify({ timestamp: '2026-09-29T01:00:00.000Z', type, payload }) + '\n';
@@ -187,4 +187,115 @@ test('handoff ignores an old turn completion recorded after a newer turn began',
   const handoff = await buildHandoff({ rolloutPath: path, thread });
   assert.match(handoff.prompt, /Current answer/);
   assert.doesNotMatch(handoff.prompt, /STALE_OLD_ANSWER/);
+});
+
+test('structured handoff preserves the current request, decisions, constraints, verification, and exact file evidence', async t => {
+  const path = withFile(t, '');
+  const cwd = join(path, '..', 'project');
+  mkdirSync(join(cwd, 'src'), { recursive: true });
+  writeFileSync(join(cwd, 'src', 'driver.py'), 'pass\n');
+  const rows = [
+    line('event_msg', { type: 'user_message', message: '初始目标：检查采集系统' }),
+    line('event_msg', { type: 'user_message', message: '必须保留现有标定参数；不要更改硬件接口。' }),
+    line('event_msg', { type: 'agent_message', phase: 'final_answer', message: '决定采用离线回放，因为实机暂不可用。' }),
+    line('event_msg', { type: 'agent_message', phase: 'commentary', message: '已修复时间戳解析；关键文件 `src/driver.py:12`。' }),
+    line('event_msg', { type: 'agent_message', phase: 'commentary', message: '验证：在项目目录执行 `pytest tests/test_driver.py`，历史记录为 8 passed。' }),
+    line('event_msg', { type: 'agent_message', phase: 'commentary', message: '下一步：补做边界采样检查。' }),
+    line('event_msg', { type: 'agent_message', phase: 'commentary', message: '阻塞：缺少实机数据。' }),
+    line('event_msg', { type: 'user_message', message: '最新目标：先完善日志，不启动实机。' }),
+    line('event_msg', { type: 'agent_message', phase: 'final_answer', message: '已收到，停在日志设计阶段。' }),
+  ];
+  writeFileSync(path, rows.join(''));
+  const result = await buildHandoff({ rolloutPath: path, thread: { ...thread, cwd } });
+  for (const phrase of ['## 最新用户要求', '## 用户约束与偏好', '## 关键决策与理由', '## 验证、运行方式与结果', '## 阻塞、失败与未决问题', '## 关键文件、目录与产物索引', '先完善日志', '必须保留现有标定参数', '采用离线回放', '因为实机暂不可用', '8 passed', '补做边界采样', '缺少实机数据']) {
+    assert.ok(result.prompt.includes(phrase), phrase);
+  }
+  assert.ok(result.prompt.indexOf('最新目标：') < result.prompt.indexOf('初始目标：'));
+  const file = result.files.find(file => file.path === join(cwd, 'src', 'driver.py'));
+  assert.equal(file.status, 'file');
+  assert.equal(file.line, 12);
+  assert.equal(file.evidence.offset, Buffer.byteLength(rows.slice(0, 3).join('')));
+  assert.ok(result.prompt.includes(JSON.stringify(file.path)));
+  assert.match(result.prompt, /当前可见文件/);
+  assert.match(result.prompt, /来源字节/);
+  assert.match(result.prompt, /\/history\?offset=/);
+  assert.equal(result.coverage.bytesRead, Buffer.byteLength(rows.join('')));
+  assert.equal(result.coverage.sampled, false);
+  assert.equal(result.coverage.messageCount, rows.length);
+  assert.equal(result.version, 2);
+  assert.ok(result.prompt.length <= HANDOFF_PROMPT_LIMIT);
+});
+
+test('large histories include middle-window file evidence while reading at most 2 MiB', async t => {
+  const bytes = Buffer.alloc(5 * 1024 * 1024, 10);
+  bytes.write(line('event_msg', { type: 'user_message', message: '从头建立验收目标' }), 0);
+  const middleOffset = Math.floor(bytes.length / 2) - 100;
+  bytes.write(line('event_msg', { type: 'agent_message', phase: 'final_answer', message: '关键入口是 `src/middle_only.py`，决定保留此方案。' }), middleOffset);
+  const ending = line('event_msg', { type: 'user_message', message: '最新请求：继续检查已列出的关键入口' });
+  bytes.write(ending, bytes.length - Buffer.byteLength(ending));
+  const result = await buildHandoff({ rolloutPath: withFile(t, bytes), thread });
+  assert.equal(result.coverage.bytesRead, HANDOFF_READ_LIMIT);
+  assert.equal(result.coverage.sampled, true);
+  assert.ok(result.coverage.windowCount > 2);
+  assert.ok(result.files.some(file => file.path === join(thread.cwd, 'src/middle_only.py')));
+  assert.match(result.prompt, /最新请求：继续检查/);
+  assert.match(result.prompt, /未读取区间可能仍有重要决定/);
+  assert.equal(result.truncated, true);
+});
+
+test('paths beyond long-message excerpts survive and worst-case structured sections stay within budget', async t => {
+  const rows = [line('event_msg', { type: 'user_message', message: '原目标' + '甲'.repeat(15000) })];
+  const terms = ['必须保留', '失败阻塞', '验证命令 npm test', '决定采用', '下一步继续', '已完成'];
+  for (let i = 0; i < 60; i++) {
+    rows.push(line('event_msg', { type: i % 6 === 0 ? 'user_message' : 'agent_message', phase: 'commentary', message: `${terms[i % 6]} ${i}：${'乙'.repeat(900)}\n关键文件 \`src/very_long_${i}_${'a'.repeat(70)}.py\`` }));
+  }
+  rows.push(line('event_msg', { type: 'agent_message', phase: 'final_answer', message: '公开说明'.repeat(2000) + '\n关键入口：`src/important_at_end.py`' }));
+  rows.push(line('event_msg', { type: 'user_message', message: '当前只检查关键路径。' }));
+  const result = await buildHandoff({ rolloutPath: withFile(t, rows.join('')), thread });
+  assert.ok(result.prompt.length <= HANDOFF_PROMPT_LIMIT);
+  assert.ok(result.files.some(file => file.path === join(thread.cwd, 'src/important_at_end.py')));
+  assert.ok(result.prompt.includes(join(thread.cwd, 'src/important_at_end.py')));
+  assert.match(result.prompt, /当前只检查关键路径/);
+  assert.equal(result.truncated, true);
+});
+
+test('a long IDE tab list cannot crowd out the actual latest user instruction', async t => {
+  const tabs = Array.from({ length: 90 }, (_, i) => `- file${i}.py: src/${'nested/'.repeat(8)}file${i}.py`).join('\n');
+  const path = withFile(t, line('event_msg', { type: 'user_message', message: '开头要求' })
+    + line('event_msg', { type: 'user_message', message: `# Context from my IDE setup:\n\n## Open tabs:\n${tabs}\n\n## My request:\n只处理最新的数据格式，不改变硬件。` }));
+  const result = await buildHandoff({ rolloutPath: path, thread });
+  assert.match(result.prompt, /只处理最新的数据格式，不改变硬件/);
+  assert.ok(result.files.length > 0);
+  assert.ok(result.prompt.length <= HANDOFF_PROMPT_LIMIT);
+});
+
+test('long latest requests and replies retain both their opening and decisive ending', async t => {
+  const path = withFile(t,
+    line('event_msg', { type: 'user_message', message: '最早目标' })
+    + line('event_msg', { type: 'user_message', message: 'CURRENT_REQUEST_START ' + '背景'.repeat(4200) + ' CRITICAL_END_REQUIREMENT' })
+    + line('event_msg', { type: 'agent_message', phase: 'final_answer', message: 'CURRENT_REPLY_START ' + '细节'.repeat(4200) + ' CRITICAL_END_RESULT' }));
+  const result = await buildHandoff({ rolloutPath: path, thread });
+  for (const text of ['CURRENT_REQUEST_START', 'CRITICAL_END_REQUIREMENT', 'CURRENT_REPLY_START', 'CRITICAL_END_RESULT']) assert.ok(result.prompt.includes(text), text);
+  assert.equal(result.truncated, true);
+  assert.ok(result.prompt.length <= HANDOFF_PROMPT_LIMIT);
+});
+
+test('a path citation does not suppress other context from the same message', async t => {
+  const path = withFile(t,
+    line('event_msg', { type: 'user_message', message: '查看入口资料' })
+    + line('event_msg', { type: 'agent_message', phase: 'commentary', message: 'See `src/entry.py`. ' + '说明'.repeat(100) + ' CRITICAL_CONTEXT_NOTE' })
+    + line('event_msg', { type: 'agent_message', phase: 'final_answer', message: '准备接续。' }));
+  const result = await buildHandoff({ rolloutPath: path, thread });
+  assert.ok(result.files.some(file => file.path === join(thread.cwd, 'src/entry.py')));
+  assert.match(result.prompt, /CRITICAL_CONTEXT_NOTE/);
+});
+
+test('automatic environment wrappers in old event messages cannot become the opening goal', async t => {
+  const path = withFile(t,
+    line('event_msg', { type: 'user_message', message: '<environment_context>PRIVATE_ENV_CONTEXT</environment_context>' })
+    + line('event_msg', { type: 'user_message', message: '<recommended_plugins>PRIVATE_PLUGINS</recommended_plugins>\n真正请求：核对交付物' }));
+  const result = await buildHandoff({ rolloutPath: path, thread });
+  assert.doesNotMatch(result.prompt, /PRIVATE_ENV_CONTEXT|PRIVATE_PLUGINS/);
+  assert.match(result.prompt, /真正请求：核对交付物/);
+  assert.equal(result.coverage.messageCount, 1);
 });
