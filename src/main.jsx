@@ -26,7 +26,12 @@ async function api(path, options = {}) {
   });
   let body;
   try { body = await response.json(); } catch { body = {}; }
-  if (!response.ok) throw new Error(body.error || body.message || `请求失败（${response.status}）`);
+  if (!response.ok) {
+    const error = new Error(body.error || body.message || `请求失败（${response.status}）`);
+    error.submission = body.submission;
+    error.threadId = body.threadId;
+    throw error;
+  }
   return body;
 }
 
@@ -325,26 +330,35 @@ function App() {
     try { await navigator.clipboard.writeText(id); notify('已复制对话 ID'); }
     catch { notify('复制失败，请在详情中选中 ID 复制。', 'error'); }
   }, [notify]);
-  const launchThread = useCallback(async (thread, windowId, windowTitle = '') => {
+  const launchThread = useCallback(async (thread, windowId, windowTitle = '', startInheritance = false) => {
     opening.current = true;
     setOpeningThreadId(thread.id);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const timeout = setTimeout(() => controller.abort(), startInheritance ? 45_000 : 15_000);
+    if (startInheritance) setSnapshot((current) => ({ ...current, threads: current.threads.map((item) => item.id === thread.id ? { ...item, inheritanceSubmission: { ...item.inheritanceSubmission, status: 'dispatching' } } : item) }));
     try {
-      const result = await api(`/api/threads/${encodeURIComponent(thread.id)}/open-vscode`, { method: 'POST', body: JSON.stringify({ windowId }), signal: controller.signal });
+      const action = startInheritance ? 'inheritance/start' : 'open-vscode';
+      const result = await api(`/api/threads/${encodeURIComponent(thread.id)}/${action}`, { method: 'POST', body: JSON.stringify({ windowId }), signal: controller.signal });
       if (!result.opened || !result.verified) throw new Error(result.message || 'VS Code 未确认打开，请检查编辑器连接。');
+      if (startInheritance && !result.submitted) throw new Error(result.message || '交接提示词尚未确认发送。');
+      if (startInheritance) setSnapshot((current) => ({ ...current, threads: current.threads.map((item) => item.id === thread.id ? { ...item, inheritanceSubmission: result.submission || { status: 'submitted', turnId: result.turnId } } : item) }));
       if (windowId !== undefined) {
         windowTargets.current[thread.cwd || projectKey(thread)] = { id: windowId, title: windowTitle };
         try { localStorage.setItem('codex-board.window-targets', JSON.stringify(windowTargets.current)); } catch { /* Browser storage may be disabled. */ }
       }
       setWindowPicker(null);
-      notify(result.reused ? '已定位到已打开的对话' : '已打开 VS Code 对话标签');
+      notify(startInheritance ? '交接提示词已发送，可在 VS Code 查看思考和回复。' : result.reused ? '已定位到已打开的对话' : '已打开 VS Code 对话标签');
     } catch (err) {
-      if (err.name === 'AbortError') err = new Error('定位超时，请检查 VS Code 是否响应后再试。');
-      notify(`打开失败：${err.message}`, 'error'); err.reported = true; throw err;
+      const uncertain = err.name === 'AbortError' || err instanceof TypeError;
+      if (err.name === 'AbortError') err = new Error(startInheritance ? '发送结果尚未确认，请在对话详情中重试核对。' : '定位超时，请检查 VS Code 是否响应后再试。');
+      if (startInheritance) {
+        setSnapshot((current) => ({ ...current, threads: current.threads.map((item) => item.id === thread.id ? { ...item, inheritanceSubmission: err.submission || { ...item.inheritanceSubmission, status: uncertain ? 'unknown' : 'failed', error: err.message } } : item) }));
+        refreshSnapshot().catch(() => {});
+      }
+      notify(`${startInheritance ? '交接提示词未确认发送' : '打开失败'}：${err.message}`, 'error'); err.reported = true; throw err;
     } finally { clearTimeout(timeout); opening.current = false; setOpeningThreadId(null); }
-  }, [notify]);
-  const openThread = useCallback(async (thread, chooseWindow = false) => {
+  }, [notify, refreshSnapshot]);
+  const openThread = useCallback(async (thread, chooseWindow = false, startInheritance = false) => {
     if (opening.current) return;
     opening.current = true;
     setOpeningThreadId(thread.id);
@@ -362,11 +376,11 @@ function App() {
       const sameFolder = windows.filter((window) => window.folders?.includes(thread.cwd));
       const destination = !chooseWindow && alreadyOpen.length === 1 ? alreadyOpen[0] : validSaved;
       if (windows.length > 1 && (chooseWindow || !destination)) {
-        setWindowPicker({ thread, windows, selected: destination?.id ?? sameFolder[0]?.id ?? windows[0].id });
+        setWindowPicker({ thread, windows, selected: destination?.id ?? sameFolder[0]?.id ?? windows[0].id, startInheritance });
         return;
       }
       const target = destination || windows[0];
-      await launchThread(thread, target.id, target.title);
+      await launchThread(thread, target.id, target.title, startInheritance);
     } catch (err) { if (!err.reported) notify(`打开失败：${err.name === 'AbortError' ? '连接检查超时，请稍后再试。' : err.message}`, 'error'); }
     finally { clearTimeout(timeout); opening.current = false; setOpeningThreadId(null); }
   }, [launchThread, notify]);
@@ -527,10 +541,10 @@ function App() {
     setFolder('');
     setSelectedThreadId(thread.id);
     setSelectedEdgeId(null);
-    notify(kind === 'inherit' ? '交接上下文已载入，正在打开 VS Code。' : '对话已创建，可打开 VS Code 继续。');
+    notify(kind === 'inherit' ? '新对话已创建，正在发送交接提示词并打开 VS Code。' : '对话已创建，可打开 VS Code 继续。');
     try { await refreshSnapshot(); } catch (err) { notify(err.message, 'error'); }
     setTimeout(() => flow.current?.fitView({ nodes: [{ id: thread.id }], padding: 1.5, maxZoom: 1, duration: 200 }), 250);
-    if (kind === 'inherit') await openThread(thread);
+    if (kind === 'inherit') await openThread(thread, false, true);
   };
 
   return (
@@ -580,7 +594,7 @@ function App() {
             <div className="detail-activity" data-status={activityPresentation(selectedThread).status}><ActivityBadge thread={selectedThread} /><p>{activityPresentation(selectedThread).reason}</p>{selectedThread.activity?.at && <small>状态记录于 {new Date(selectedThread.activity.at).toLocaleString('zh-CN')}</small>}</div>
             <p className="detail-preview">{selectedThread.preview || '暂无内容预览'}</p>
             <RecentReplies key={selectedThread.id} thread={selectedThread} />
-            {selectedThread.inheritedFromId && <InheritedPrompt key={`inherited:${selectedThread.id}`} threadId={selectedThread.id} notify={notify} />}
+            {selectedThread.inheritedFromId && <InheritedPrompt key={`inherited:${selectedThread.id}`} thread={selectedThread} notify={notify} onStart={() => openThread(selectedThread, false, true)} starting={!!openingThreadId} />}
             <div className="assignment-fields"><div className="assignment-label"><label htmlFor="assign-project">项目</label><button className="icon-button" aria-label="编辑项目和任务" title="编辑项目和任务" onClick={() => setOrganizationModal({ projectId: selectedAssignment.projectId })}><Pencil size={12} /></button></div><select id="assign-project" className="form-input" data-testid="assign-project" value={selectedAssignment.projectId || ''} disabled={organizationSaving} onChange={(event) => assignThread(event.target.value)}><option value="">未归类</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><div className="assignment-label"><label htmlFor="assign-task">任务</label>{selectedAssignment.projectId && <button className="icon-button" aria-label="添加项目任务" title="添加项目任务" onClick={() => setOrganizationModal({ projectId: selectedAssignment.projectId, action: 'createTask' })}><Plus size={12} /></button>}</div><select id="assign-task" className="form-input" data-testid="assign-task" value={selectedAssignment.taskId || ''} disabled={organizationSaving || !selectedAssignment.projectId} onChange={(event) => assignThread(selectedAssignment.projectId, event.target.value)}><option value="">未指定任务</option>{organization.tasks.filter((task) => task.projectId === selectedAssignment.projectId).map((task) => <option key={task.id} value={task.id}>{task.name}</option>)}</select></div>
             <dl><dt>对话 ID <button className="icon-button" aria-label="复制详情中的对话 ID" data-testid="detail-copy" onClick={() => copyId(selectedThread.id)}><Copy size={12} /></button></dt><dd className="thread-id" data-testid="detail-thread-id">{selectedThread.id}</dd><dt>文件夹</dt><dd>{shortPath(selectedThread.cwd) || '未知'}</dd><dt>Git 分支</dt><dd>{selectedThread.branch || '分支未知'}</dd><dt>最近活动</dt><dd>{selectedThread.updatedAt ? new Date(Number(selectedThread.updatedAt)).toLocaleString('zh-CN') : '未知'}</dd>{selectedThread.inheritedFromId && <><dt>继承来源</dt><dd className="thread-id" data-testid="detail-inherited-from">{selectedThread.inheritedFromId}</dd></>}{selectedThread.forkedFromId && <><dt>Fork 来源</dt><dd className="thread-id">{selectedThread.forkedFromId}</dd></>}</dl>
             <button className="primary-button full-width" onClick={() => openThread(selectedThread)} disabled={snapshot.capabilities.openVscode === false || !!openingThreadId} data-testid="detail-open">{openingThreadId === selectedThread.id ? <LoaderCircle size={15} className="spin" /> : <ArrowUpRight size={15} />}{openingThreadId === selectedThread.id ? '正在定位…' : '在 VS Code 打开'}</button><button className="change-window" onClick={() => openThread(selectedThread, true)} disabled={snapshot.capabilities.openVscode === false || !!openingThreadId} data-testid="change-window">选择其他 VS Code 窗口</button><button className="secondary-button full-width inherit-detail-button" onClick={() => inheritThread(selectedThread)} disabled={snapshot.capabilities.inherit === false || snapshot.capabilities.create === false || !!openingThreadId} data-testid="detail-inherit"><ArrowRightToLine size={14} />继承为新对话</button><button className="secondary-button full-width" onClick={() => forkThread(selectedThread)} disabled={snapshot.capabilities.fork === false} data-testid="detail-fork"><GitFork size={14} /> 从此对话 Fork</button>
@@ -591,7 +605,7 @@ function App() {
       </main>
       {modal && <ThreadModal key={`${modal.kind}:${modal.thread?.id || 'new'}`} modal={modal} folders={workspaceOptions.length ? workspaceOptions : folders} organization={organization} onClose={() => setModal(null)} onCreated={onCreated} />}
       {organizationModal && <OrganizationModal initial={organizationModal} organization={organization} onClose={() => setOrganizationModal(null)} onSave={updateOrganization} />}
-      {windowPicker && <WindowPicker picker={windowPicker} onClose={() => setWindowPicker(null)} onOpen={launchThread} />}
+      {windowPicker && <WindowPicker picker={windowPicker} onClose={() => setWindowPicker(null)} onOpen={(thread, windowId, windowTitle) => launchThread(thread, windowId, windowTitle, windowPicker.startInheritance)} />}
       {toast && <div className={`toast ${toast.kind}`} role="status" data-testid="toast">{toast.kind === 'success' ? <Check size={15} /> : <X size={15} />}{toast.message}</div>}
     </div>
   );
@@ -618,7 +632,8 @@ function InheritedSettings({ settings, title = '沿用来源配置', testId = 'i
   </section>;
 }
 
-function InheritedPrompt({ threadId, notify }) {
+function InheritedPrompt({ thread, notify, onStart, starting }) {
+  const threadId = thread.id;
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -634,7 +649,7 @@ function InheritedPrompt({ threadId, notify }) {
     setExpanded(true); setLoading(true); setError('');
     try {
       const data = await api(`/api/threads/${encodeURIComponent(threadId)}/inheritance`, { signal: controller.signal });
-      if (request.current === controller && !controller.signal.aborted) setResult({ source: data.source, prompt: typeof data.prompt === 'string' ? data.prompt : '', settings: data.settings });
+      if (request.current === controller && !controller.signal.aborted) setResult({ source: data.source, prompt: typeof data.prompt === 'string' ? data.prompt : '', settings: data.settings, submission: data.submission });
     } catch (err) {
       if (request.current === controller && (!controller.signal.aborted || timedOut)) setError(timedOut ? '读取超时，请重试。' : err.message);
     } finally {
@@ -647,8 +662,20 @@ function InheritedPrompt({ threadId, notify }) {
     try { await navigator.clipboard.writeText(result.prompt); notify('已复制交接提示词'); }
     catch { notify('复制失败，可选中下方提示词手动复制。', 'error'); }
   };
+  const submission = thread.inheritanceSubmission || result?.submission;
+  const status = submission?.status || 'legacy';
+  const statusText = {
+    pending: '交接提示词尚未发送。发送后可在 VS Code 看到提示词、思考和回复。',
+    dispatching: '正在向 VS Code 发送交接提示词，等待确认…',
+    submitted: '交接提示词已发送。在 VS Code 查看思考和回复，确认后继续交流。',
+    failed: '发送交接提示词失败。可重试发送到这条新对话。',
+    unknown: '发送结果尚未确认。可核对这条对话的已有记录，避免重复发送。',
+    legacy: '旧版交接资料未自动发送为可见消息；已继续交流的对话无需补发。',
+  }[status] || '交接提示词的发送状态未知。';
   return <section className="inheritance-context" data-testid="inheritance-context">
-    <p className="handoff-note">交接上下文已载入，打开后发送下一条消息即可继续。</p>
+    <p className="handoff-note" data-testid="inheritance-submission-status" role="status">{statusText}</p>
+    {submission?.error && status !== 'submitted' && <p className="form-error" data-testid="inheritance-submission-error">{submission.error}</p>}
+    {status !== 'submitted' && <button className="primary-button full-width" data-testid="inheritance-start" onClick={onStart} disabled={starting || status === 'dispatching'}>{starting || status === 'dispatching' ? <LoaderCircle size={14} className="spin" /> : <ArrowRightToLine size={14} />}{status === 'dispatching' ? '正在发送…' : status === 'unknown' ? '核对发送结果并打开' : status === 'failed' ? '重试发送并打开' : '发送交接并打开'}</button>}
     {!expanded ? <button className="secondary-button full-width" onClick={load} aria-expanded="false" data-testid="show-inheritance"><ArrowRightToLine size={14} />查看交接提示词</button> : <>
       <div className="replies-heading"><strong>交接提示词</strong><button className="icon-button" title="复制交接提示词" aria-label="复制交接提示词" onClick={copyPrompt} disabled={loading || !result?.prompt} data-testid="inheritance-copy"><Copy size={13} /></button><button className="replies-collapse" onClick={collapse} data-testid="collapse-inheritance">收起</button></div>
       {loading && <p className="handoff-loading" role="status"><LoaderCircle size={13} className="spin" />正在读取交接提示词…</p>}
@@ -713,7 +740,7 @@ function WindowPicker({ picker, onClose, onOpen }) {
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [onClose, busy]);
-  return <div className="modal-overlay"><section className="modal window-modal" role="dialog" aria-modal="true" aria-labelledby="window-modal-title" data-testid="window-picker"><div className="modal-heading"><span className="modal-icon"><ArrowUpRight size={21} /></span><button className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭窗口选择"><X size={18} /></button></div><h2 id="window-modal-title">在哪个窗口打开？</h2><p className="modal-description">已打开多个 VS Code 窗口。选择会记住，供这个文件夹下次使用。</p><div className="window-options">{picker.windows.map((window) => <label className={`window-option ${selected === window.id ? 'selected' : ''}`} key={window.id}><input type="radio" name="vscode-window" checked={selected === window.id} onChange={() => setSelected(window.id)} disabled={busy} data-testid={`window-option-${window.id}`} /><span>{window.title || `VS Code 窗口 ${window.id}`}</span></label>)}</div><div className="modal-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" disabled={busy} data-testid="window-picker-open" onClick={async () => { setBusy(true); try { await onOpen(picker.thread, selected, picker.windows.find((window) => window.id === selected)?.title); } catch { setBusy(false); } }}>{busy ? <LoaderCircle className="spin" size={14} /> : <ArrowUpRight size={14} />}{busy ? '正在打开…' : '打开对话'}</button></div></section></div>;
+  return <div className="modal-overlay"><section className="modal window-modal" role="dialog" aria-modal="true" aria-labelledby="window-modal-title" data-testid="window-picker"><div className="modal-heading"><span className="modal-icon"><ArrowUpRight size={21} /></span><button className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭窗口选择"><X size={18} /></button></div><h2 id="window-modal-title">{picker.startInheritance ? '在哪个窗口发送并打开？' : '在哪个窗口打开？'}</h2><p className="modal-description">已打开多个 VS Code 窗口。选择会记住，供这个文件夹下次使用。</p><div className="window-options">{picker.windows.map((window) => <label className={`window-option ${selected === window.id ? 'selected' : ''}`} key={window.id}><input type="radio" name="vscode-window" checked={selected === window.id} onChange={() => setSelected(window.id)} disabled={busy} data-testid={`window-option-${window.id}`} /><span>{window.title || `VS Code 窗口 ${window.id}`}</span></label>)}</div><div className="modal-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" disabled={busy} data-testid="window-picker-open" onClick={async () => { setBusy(true); try { await onOpen(picker.thread, selected, picker.windows.find((window) => window.id === selected)?.title); } catch { setBusy(false); } }}>{busy ? <LoaderCircle className="spin" size={14} /> : <ArrowUpRight size={14} />}{busy ? picker.startInheritance ? '正在发送…' : '正在打开…' : picker.startInheritance ? '发送交接并打开' : '打开对话'}</button></div></section></div>;
 }
 
 function OrganizationModal({ initial, organization, onClose, onSave }) {
@@ -834,7 +861,7 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
     let result;
     try {
       const url = ['fork', 'inherit'].includes(modal.kind) ? `/api/threads/${encodeURIComponent(sourceId)}/${modal.kind}` : '/api/threads';
-      const payload = { cwd: cwd.trim(), title: title.trim(), ...assignment, ...(isInherit ? { prompt: prompt.trim() } : {}) };
+      const payload = { cwd: cwd.trim(), title: title.trim(), ...assignment, ...(isInherit ? { prompt } : {}) };
       const fingerprint = `${url}:${JSON.stringify(payload)}`;
       if (creationRequest.current?.fingerprint !== fingerprint) creationRequest.current = { fingerprint, requestId: crypto.randomUUID() };
       result = await api(url, { method: 'POST', body: JSON.stringify({ ...payload, requestId: creationRequest.current.requestId }) });
@@ -843,8 +870,8 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
       setError(err instanceof TypeError ? '连接中断，创建结果尚未确认。请保持当前内容重试，以恢复本次结果。' : err.message); setSubmitting(false); submitBusy.current = false;
       return;
     }
-    // Creation has succeeded. Opening the editor is a separate action, so an
-    // editor failure must never re-enable this POST or create another thread.
+    // Creation has succeeded. Sending the first message uses this same child;
+    // an editor or submission failure must never create another thread.
     await onCreated(result.thread, assignment, modal.kind);
   }
   const blocked = submitting || (isInherit && (!handoff.loaded || handoff.loading || !prompt.trim() || prompt.length > maxPromptLength));
@@ -852,7 +879,7 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
   return <div className="modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget && !submitBusy.current) onClose(); }}><section className={`modal ${isInherit ? 'inherit-modal' : ''}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" data-testid="thread-modal">
     <div className="modal-heading"><span className="modal-icon">{modal.kind === 'fork' ? <GitFork size={21} /> : isInherit ? <ArrowRightToLine size={21} /> : <Plus size={21} />}</span><button className="icon-button" onClick={onClose} disabled={submitting} aria-label="关闭窗口"><X size={18} /></button></div>
     <h2 id="modal-title">{modal.kind === 'fork' ? 'Fork 对话' : isInherit ? '继承为新对话' : '新建对话'}</h2>
-    <p className="modal-description">{modal.kind === 'fork' ? '沿用这条对话的上下文，并创建新的独立对话。' : isInherit ? '创建独立新对话，沿用已记录的来源配置并带入下方交接提示词，适合长对话继续。创建后会打开 VS Code，发送下一条消息即可继续。' : '创建后可在 VS Code 中开始对话。'}</p>
+    <p className="modal-description">{modal.kind === 'fork' ? '沿用这条对话的上下文，并创建新的独立对话。' : isInherit ? '创建独立新对话，沿用来源模型和思考配置，自动发送下方提示词并打开 VS Code。你会看到提示词、Codex 的思考状态和继承确认回复，再继续交流。' : '创建后可在 VS Code 中开始对话。'}</p>
     {['fork', 'inherit'].includes(modal.kind) && <div className={`fork-origin ${isInherit ? 'inherit-origin' : ''}`} data-testid={isInherit ? 'inherit-origin' : undefined}>{isInherit ? <ArrowRightToLine size={13} /> : <GitFork size={13} />}<span>{titleOf(modal.thread)}</span></div>}
     <div className="creation-permissions" data-testid="modal-permissions"><strong>Full Access</strong><span>· 完整文件与命令访问，无需逐项审批</span></div>
     <form onSubmit={submit}>
@@ -870,7 +897,7 @@ function ThreadModal({ modal, folders, organization, onClose, onCreated }) {
         {handoff.loaded && <p className={`handoff-note ${handoff.truncated ? 'is-truncated' : ''}`} data-testid="inherit-note">{handoff.messageCount ? `${handoff.version === 2 ? '交接内容选入' : '已读取'} ${handoff.messageCount} 条公开消息。` : '暂无可用公开消息，可自行补写交接提示词。'}{handoff.truncated && ' 内容已截取，请补齐需要保留的信息。'}</p>}
       </section>}
       {error && <p className="form-error" role="alert" data-testid="modal-error">{error}</p>}
-      <div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={submitting} data-testid="modal-cancel">取消</button><button type="submit" className="primary-button" disabled={blocked} data-testid="modal-submit">{submitting ? <LoaderCircle className="spin" size={14} /> : actionIcon}{submitting ? '正在创建…' : modal.kind === 'fork' ? '创建 Fork' : isInherit ? '继承并打开' : '创建对话'}</button></div>
+      <div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={submitting} data-testid="modal-cancel">取消</button><button type="submit" className="primary-button" disabled={blocked} data-testid="modal-submit">{submitting ? <LoaderCircle className="spin" size={14} /> : actionIcon}{submitting ? '正在创建…' : modal.kind === 'fork' ? '创建 Fork' : isInherit ? '继承、发送并打开' : '创建对话'}</button></div>
     </form>
   </section></div>;
 }

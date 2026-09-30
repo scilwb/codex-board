@@ -153,6 +153,28 @@ export class BoardStore {
     return handoff ? structuredClone(handoff) : null;
   }
 
+  updateInheritanceSubmission(id, submission) {
+    const thread = this.state.managedThreads[id];
+    if (!UUID.test(id) || !thread?.inheritance) throw Object.assign(new Error('这条对话没有保存的交接提示词'), { status: 404 });
+    if (!isRecord(submission) || Object.keys(submission).some(key => !['status', 'updatedAt', 'submissionId', 'turnId', 'error'].includes(key)) ||
+      !['pending', 'dispatching', 'submitted', 'failed', 'unknown'].includes(submission.status) ||
+      !Number.isSafeInteger(submission.updatedAt) || submission.updatedAt <= 0 ||
+      (submission.submissionId !== undefined && !UUID.test(submission.submissionId)) ||
+      (submission.turnId !== undefined && (typeof submission.turnId !== 'string' || !submission.turnId || submission.turnId.length > 200)) ||
+      (submission.error !== undefined && (typeof submission.error !== 'string' || submission.error.length > 1000))) throw new Error('继承发送状态无效');
+    const previous = thread.inheritance.submission;
+    if (previous?.submissionId && previous.submissionId !== submission.submissionId) throw Object.assign(new Error('继承发送标识不能改变'), { status: 409 });
+    if (previous?.status === 'submitted' && submission.status !== 'submitted') throw Object.assign(new Error('已发送的交接不能再次提交'), { status: 409 });
+    // Persist only this receipt. Conversation settings, prompt, graph, creation
+    // receipts and project assignments remain the same objects and values.
+    const nextState = { ...this.state, managedThreads: { ...this.state.managedThreads,
+      [id]: { ...thread, inheritance: { ...thread.inheritance, submission: structuredClone(submission) } },
+    } };
+    this.save(nextState);
+    this.state = nextState;
+    return structuredClone(submission);
+  }
+
   threads() {
     const db = this.database();
     const managedIds = Object.keys(this.state.managedThreads);
@@ -164,12 +186,14 @@ export class BoardStore {
       const managed = this.state.managedThreads[row.id] || {};
       const rollout = this.rollout(row.rollout_path);
       const assignment = this.state.organization.assignments[row.id];
+      const inheritanceStatus = managed.inheritance?.submission?.status || 'legacy';
       const inheritedPreview = managed.inheritance?.prompt && rollout.lastMessage === shorten(managed.inheritance.prompt)
-        ? managed.preview : null;
+        ? inheritanceStatus === 'submitted' ? `已发送「${managed.inheritance.source?.title || '来源对话'}」的交接提示词。`
+          : inheritanceStatus === 'legacy' ? '已保存交接提示词，请在 VS Code 中查看接续状态。' : managed.preview : null;
       return {
         id: row.id,
         title: shorten(row.name || managed.title || row.title || row.first_user_message || '未命名对话', 120),
-        preview: inheritedPreview || rollout.lastMessage || shorten(row.preview || row.first_user_message),
+        preview: inheritedPreview || rollout.lastMessage || (managed.inheritance ? managed.preview : null) || shorten(row.preview || row.first_user_message),
         cwd: row.cwd,
         folder: basename(row.cwd) || row.cwd,
         // Retained for older clients; new UI uses folder + organization.
@@ -181,9 +205,15 @@ export class BoardStore {
         createdAt: timestamp(row.created_at, row.created_at_ms),
         forkedFromId: rollout.forkedFromId || managed.forkedFromId || null,
         inheritedFromId: managed.inheritedFromId || null,
+        ...(managed.inheritance ? { inheritanceSubmission: structuredClone(managed.inheritance.submission || {
+          status: 'legacy', updatedAt: timestamp(row.created_at, row.created_at_ms) || Date.now(),
+        }) } : {}),
         status: rollout.activity.status,
         activity: inheritedPreview && rollout.activity.status === 'unknown'
-          ? { ...rollout.activity, reason: '交接上下文已载入，发送下一条消息即可继续。' } : rollout.activity,
+          ? { ...rollout.activity, reason: inheritanceStatus === 'submitted'
+            ? '交接提示词已发送，请在 VS Code 中查看模型回复。'
+            : inheritanceStatus === 'legacy' ? '已保存交接提示词，请在 VS Code 中查看接续状态。'
+              : '交接提示词尚未作为消息发送，点击发送接续可开始。' } : rollout.activity,
         archived: false,
       };
     });

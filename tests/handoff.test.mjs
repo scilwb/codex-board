@@ -16,7 +16,7 @@ function withFile(t, contents) {
   return path;
 }
 
-test('handoff includes only public messages, deduplicates stored representations, and waits for a new instruction', async t => {
+test('handoff includes only public messages, deduplicates records, and asks for a visible acknowledgment before waiting', async t => {
   const path = withFile(t, [
     line('session_meta', { id: thread.id }),
     line('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: '请检查夹爪关节限位' }] }),
@@ -47,6 +47,13 @@ test('handoff includes only public messages, deduplicates stored representations
   assert.match(handoff.prompt, /核实当前文件/);
   assert.match(handoff.prompt, /等待我的下一条指令/);
   assert.match(handoff.prompt, /不要自动继续旧任务/);
+  assert.match(handoff.prompt, /## 本轮先做：回复继承确认/);
+  assert.match(handoff.prompt, /请现在直接回复一段简洁的继承确认/);
+  assert.match(handoff.prompt, /当前目标与主要约束，以及来源对话 ID/);
+  assert.match(handoff.prompt, /关键文件路径/);
+  assert.match(handoff.prompt, /历史结果标为尚未重新核验/);
+  assert.match(handoff.prompt, /明确区分已知与未知/);
+  assert.match(handoff.prompt, /无需执行命令、联网、读取历史或修改文件/);
   assert.ok(handoff.prompt.includes(JSON.stringify(path)));
 });
 

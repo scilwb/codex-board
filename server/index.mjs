@@ -3,7 +3,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { resolve, join, extname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { BoardStore, UUID } from './store.mjs';
 import { AppServerClient } from './app-server.mjs';
 import { EditorBridge } from './bridge.mjs';
@@ -92,15 +92,26 @@ export function createServer(options = {}) {
   const distDir = resolve(options.distDir || join(ROOT, 'dist'));
   const store = new BoardStore({ codexHome, dataDir });
   const appServer = options.appServer || new AppServerClient({ codexHome, binary: options.codexBinary });
-  const bridge = options.bridge || new EditorBridge({ dataDir, ...options.bridgeOptions });
+  const bridge = options.bridge || new EditorBridge({ dataDir, codexHome, ...options.bridgeOptions });
   const desktopNotifications = options.desktopNotifications || new DesktopNotifications({ dataDir, onOpen: threadId => bridge.open(threadId) });
   const branches = options.branches || new GitBranches();
   const creationRequests = new Map();
+  const inheritanceSubmissions = new Map();
   const clients = new Set();
   let lastSnapshot = '';
   let operationInFlight = false;
   let replyReads = 0;
   let closed = false;
+
+  // A service restart can lose an editor acknowledgement, never the receipt
+  // identity. The next attempt reconciles this same submission with native
+  // history before the bridge is allowed to dispatch another user message.
+  for (const [id, thread] of Object.entries(store.state.managedThreads)) {
+    if (thread.inheritance?.submission?.status === 'dispatching') {
+      store.updateInheritanceSubmission(id, { ...thread.inheritance.submission, status: 'unknown', updatedAt: Date.now(),
+        error: '服务在发送过程中重启，请重试确认接续状态。' });
+    }
+  }
 
   function snapshot() {
     let threads = [], error;
@@ -180,6 +191,7 @@ export function createServer(options = {}) {
     if (assignment?.taskId && !organization.tasks.some(task => task.id === assignment.taskId && task.projectId === assignment.projectId)) throw fail('任务不属于所选项目');
     operationInFlight = true;
     let createdId = null;
+    let saved = false;
     try {
       const sourceSettings = inheriting ? await store.threadSettings(parent.id) : {};
       const result = parent && !inheriting
@@ -192,15 +204,10 @@ export function createServer(options = {}) {
       await appServer.request('thread/name/set', { threadId: created.id, name: title });
       const settings = inheriting ? inheritedUpdateOptions(sourceSettings, result) : {};
       await appServer.request('thread/settings/update', { threadId: created.id, ...settings, ...CREATION_ACCESS_SETTINGS });
-      if (inheriting) {
-        // Seed a fresh model-visible history without starting inference. Never
-        // copy the source rollout or modify the user's Codex database directly.
-        await appServer.request('thread/inject_items', {
-          threadId: created.id,
-          items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] }],
-        });
-      }
-      // Flush history, then wait for the metadata process to exit. Unsubscribe
+      // The prompt is sent as a real visible turn by VS Code after this process
+      // releases the writer. Injected history does not create a visible chat
+      // bubble or start the model and cannot implement conversation continuation.
+      // Flush metadata, then wait for the metadata process to exit. Unsubscribe
       // alone can leave the native writer locked until its 30-second idle exit,
       // making VS Code's immediate resume fail with "already has an active writer".
       await appServer.request('thread/unsubscribe', { threadId: created.id });
@@ -211,7 +218,7 @@ export function createServer(options = {}) {
       const thread = {
         id: created.id,
         title,
-        preview: inheriting ? `已继承「${parent.title}」的交接提示词，可继续对话。` : created.preview || parent?.preview || '',
+        preview: inheriting ? `待发送「${parent.title}」的交接提示词。` : created.preview || parent?.preview || '',
         cwd: created.cwd || cwd,
         project: basename(created.cwd || cwd),
         branch: created.gitInfo?.branch || await branches.get(cwd),
@@ -219,17 +226,20 @@ export function createServer(options = {}) {
         createdAt: (created.createdAt || Math.floor(Date.now() / 1000)) * 1000,
         forkedFromId: inheriting ? null : parent?.id || created.forkedFromId || null,
         inheritedFromId: inheriting ? parent.id : null,
+        ...(inheriting ? { inheritanceSubmission: { status: 'pending', updatedAt: Date.now() } } : {}),
         status: 'unknown',
         archived: false,
       };
       store.remember(inheriting ? {
         ...thread,
-        inheritance: { source: { id: parent.id, title: parent.title, cwd: parent.cwd }, prompt, settings: sourceSettings },
+        inheritance: { source: { id: parent.id, title: parent.title, cwd: parent.cwd }, prompt, settings: sourceSettings,
+          submission: thread.inheritanceSubmission },
       } : thread, { ...receipt, assignment: assignment?.projectId ? assignment : null });
+      saved = true;
       broadcast(true);
       return thread;
     } catch (error) {
-      if (createdId) {
+      if (createdId && !saved) {
         // Failed access/settings/history setup must not look successful
         // or leave another incomplete conversation on every retry.
         await appServer.request('thread/unsubscribe', { threadId: createdId }).catch(() => {});
@@ -242,6 +252,68 @@ export function createServer(options = {}) {
       try { await appServer.stopAndWait?.(); }
       finally { operationInFlight = false; }
     }
+  }
+
+  async function startInheritance(id, body) {
+    if (options.disableActions) throw fail('本环境未启用继承发送', 503);
+    if (options.disableOpen) throw fail('本环境未启用 VS Code 跳转，无法发送交接提示词', 503);
+    if (body.windowId != null && (typeof body.windowId !== 'string' || !UUID.test(body.windowId))) throw fail('VS Code 窗口标识无效');
+    const thread = findThread(id);
+    const handoff = store.inheritance(thread.id);
+    if (!handoff || typeof handoff.prompt !== 'string' || !handoff.prompt.trim()) throw fail('这条对话没有保存的交接提示词', 404);
+    const record = store.database().prepare('SELECT rollout_path FROM threads WHERE id=?').get(thread.id);
+    if (!record?.rollout_path || !existsSync(record.rollout_path)) throw fail('这条对话的历史文件不在本机，已停止发送交接提示词。', 409);
+    if (handoff.submission?.status === 'submitted') {
+      const opened = body.windowId != null ? await bridge.open(thread.id, body.windowId) : null;
+      return { submitted: true, opened: opened?.opened === true, verified: true, alreadySubmitted: true,
+        ...(handoff.submission.turnId ? { turnId: handoff.submission.turnId } : {}), submission: handoff.submission };
+    }
+    const pending = inheritanceSubmissions.get(thread.id);
+    if (pending) return pending;
+    if (typeof bridge.submitInheritance !== 'function') throw fail('VS Code 桥接尚不支持发送接续，请更新后重试', 503);
+    const submissionId = handoff.submission?.submissionId || randomUUID();
+    const previouslyUncertain = ['unknown', 'dispatching'].includes(handoff.submission?.status);
+    const operation = (async () => {
+      const dispatching = store.updateInheritanceSubmission(thread.id, { status: 'dispatching', submissionId, updatedAt: Date.now() });
+      broadcast(true);
+      try {
+        // Native full-history loading can reject a newly created empty thread
+        // even after VS Code owns its writer. Supply a strictly bounded proof
+        // for that adapter fallback; partial/error reads never prove emptiness.
+        let historyEmptyVerified = false;
+        try {
+          const history = await store.publicHistory(thread.id, 0);
+          historyEmptyVerified = Array.isArray(history.messages) && history.messages.length === 0 &&
+            history.hasMore === false && history.limited === false &&
+            Number.isSafeInteger(history.totalBytes) && history.totalBytes >= 0 && history.nextOffset === history.totalBytes;
+        } catch { /* The adapter must use its normal native history checks. */ }
+        const result = await bridge.submitInheritance(thread.id, { windowId: body.windowId, prompt: handoff.prompt,
+          settings: { ...handoff.settings, cwd: thread.cwd }, submissionId,
+          allowDispatch: !previouslyUncertain, historyEmptyVerified });
+        if (result?.submitted !== true || result?.verified !== true) throw Object.assign(fail('VS Code 尚未确认交接提示词已作为消息发送，请重试确认状态。', 502), {
+          dispatched: result?.dispatched === false ? false : true,
+        });
+        const submission = store.updateInheritanceSubmission(thread.id, { ...dispatching, status: 'submitted', updatedAt: Date.now(),
+          ...(typeof result.turnId === 'string' ? { turnId: result.turnId } : {}) });
+        broadcast(true);
+        return { ...result, submitted: true, opened: true, verified: true, submission };
+      } catch (error) {
+        // Definite pre-dispatch errors permit another attempt. An uncertain
+        // acknowledgement is reconciled by the bridge with the same receipt.
+        const message = typeof error.message === 'string' && !error.message.includes(handoff.prompt)
+          ? error.message.slice(0, 1000) : '发送接续尚未确认，请重试确认状态。';
+        error.message = message;
+        const submission = { ...dispatching, status: !previouslyUncertain && error.dispatched === false ? 'failed' : 'unknown', updatedAt: Date.now(), error: message };
+        try { store.updateInheritanceSubmission(thread.id, submission); } catch { /* Persisted dispatching remains safe to reconcile. */ }
+        broadcast(true);
+        error.submission = store.inheritance(thread.id)?.submission || submission;
+        error.threadId = thread.id;
+        throw error;
+      }
+    })();
+    inheritanceSubmissions.set(thread.id, operation);
+    try { return await operation; }
+    finally { inheritanceSubmissions.delete(thread.id); }
   }
 
   const server = http.createServer(async (request, response) => {
@@ -352,6 +424,8 @@ export function createServer(options = {}) {
         if (!inheritance) throw fail('这条对话没有保存的交接提示词', 404);
         return json(response, 200, inheritance);
       }
+      const inheritanceStartMatch = pathname.match(/^\/api\/threads\/([^/]+)\/inheritance\/start$/);
+      if (request.method === 'POST' && inheritanceStartMatch) return json(response, 200, await startInheritance(inheritanceStartMatch[1], await readJson(request)));
       const inheritMatch = pathname.match(/^\/api\/threads\/([^/]+)\/inherit$/);
       if (request.method === 'POST' && inheritMatch) return json(response, 201, { thread: await createRequest(await readJson(request), inheritMatch[1], 'inherit') });
       const forkMatch = pathname.match(/^\/api\/threads\/([^/]+)\/fork$/);
@@ -380,7 +454,8 @@ export function createServer(options = {}) {
       if (request.method === 'HEAD') response.end();
       else createReadStream(path).on('error', () => response.destroy()).pipe(response);
     } catch (error) {
-      if (!response.headersSent) json(response, error.status || 400, { error: error.message || '操作失败' });
+      if (!response.headersSent) json(response, error.status || 400, { error: error.message || '操作失败',
+        ...(error.submission ? { submission: error.submission, threadId: error.threadId } : {}) });
       else response.destroy();
     }
   });

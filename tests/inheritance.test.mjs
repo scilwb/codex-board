@@ -21,6 +21,7 @@ async function setup(t, options = {}) {
       return { thread: { id, path: pathFor(id), cwd: params.cwd } };
     }
     if (method === 'thread/name/set') {
+      await options.nameSet?.(params);
       fixture.db.prepare('UPDATE threads SET name=? WHERE id=?').run(params.name, params.threadId);
       return {};
     }
@@ -31,11 +32,6 @@ async function setup(t, options = {}) {
           model: params.model, reasoning_effort: params.effort, collaboration_mode: params.collaborationMode,
         },
       } }) + '\n');
-      return {};
-    }
-    if (method === 'thread/inject_items') {
-      await options.inject?.(params);
-      for (const item of params.items) appendFileSync(pathFor(params.threadId), JSON.stringify({ type: 'response_item', payload: item }) + '\n');
       return {};
     }
     if (method === 'thread/unsubscribe') return {};
@@ -111,7 +107,7 @@ test('交接中的来源字节可通过只读接口准确找回公开消息，�
   assert.equal(readFileSync(path, 'utf8'), before);
 });
 
-test('继承创建独立ID和短提示上下文，沿用分类，来源持久化且快照不携带提示全文', async t => {
+test('继承创建独立ID并保存待发送提示，沿用分类，来源持久化且快照不携带提示全文', async t => {
   const { fixture, calls, request, pathFor } = await setup(t);
   const id = fixture.ids[0];
   const sourceBefore = readFileSync(pathFor(id), 'utf8');
@@ -126,14 +122,16 @@ test('继承创建独立ID和短提示上下文，沿用分类，来源持久化
   assert.equal(created.forkedFromId, null);
   assert.equal(created.inheritedFromId, id);
   assert.equal(created.title, fixture.names[0] + ' · 续聊');
-  assert.deepEqual(calls.map(call => call.method), ['thread/start', 'thread/name/set', 'thread/settings/update', 'thread/inject_items', 'thread/unsubscribe']);
+  assert.deepEqual(calls.map(call => call.method), ['thread/start', 'thread/name/set', 'thread/settings/update', 'thread/unsubscribe']);
   assert.equal(calls[0].params.cwd, fixture.cwd);
   assert.equal(calls[0].params.ephemeral, false);
-  assert.deepEqual(calls[3].params, { threadId: created.id, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] }] });
+  assert.deepEqual(calls[3].params, { threadId: created.id });
+  assert.equal(created.inheritanceSubmission.status, 'pending');
   assert.equal(readFileSync(pathFor(id), 'utf8'), sourceBefore);
   assert.ok(!readFileSync(pathFor(created.id), 'utf8').includes(fixture.names[0] + '已有进展'));
   const snapshot = (await request('/api/snapshot')).body;
   assert.equal(snapshot.threads.find(thread => thread.id === created.id).inheritedFromId, id);
+  assert.equal(snapshot.threads.find(thread => thread.id === created.id).inheritanceSubmission.status, 'pending');
   assert.deepEqual(snapshot.organization.assignments[created.id], { projectId: project.id, taskId: task.id });
   assert.ok(!JSON.stringify(snapshot).includes(prompt));
   const handoff = await request(`/api/threads/${created.id}/inheritance`);
@@ -185,9 +183,9 @@ test('继承响应与发布等待创建进程释放写锁，期间不接受第�
   assert.ok(server.board.store.inheritance(result.body.thread.id));
 });
 
-test('注入失败归档此次空对话，来源保持原样，重试可成功', async t => {
+test('元数据设置失败归档此次空对话，来源保持原样，重试可成功', async t => {
   let fail = true;
-  const { fixture, request, calls, pathFor } = await setup(t, { inject() { if (fail) throw new Error('Unsupported thread/inject_items'); } });
+  const { fixture, request, calls, pathFor } = await setup(t, { nameSet() { if (fail) throw new Error('名称设置失败'); } });
   const id = fixture.ids[0];
   const before = readFileSync(pathFor(id), 'utf8');
   const url = `/api/threads/${id}/inherit`;
@@ -206,7 +204,7 @@ test('注入失败归档此次空对话，来源保持原样，重试可成功',
 });
 
 test('归档补偿失败明确指出留下的新ID，不误报继承成功', async t => {
-  const { fixture, request, calls } = await setup(t, { inject() { throw new Error('注入失败'); }, archive() { throw new Error('归档失败'); } });
+  const { fixture, request, calls } = await setup(t, { nameSet() { throw new Error('名称设置失败'); }, archive() { throw new Error('归档失败'); } });
   const result = await request(`/api/threads/${fixture.ids[0]}/inherit`, 'POST', { prompt: '交接内容' });
   const id = calls.find(call => call.method === 'thread/archive').params.threadId;
   assert.equal(result.status, 502);
@@ -218,7 +216,7 @@ test('并行重复创建在前一操作结束前被拒绝', async t => {
   let release, entered;
   const gate = new Promise(resolve => { release = resolve; });
   const started = new Promise(resolve => { entered = resolve; });
-  const { fixture, request, calls } = await setup(t, { async inject() { entered(); await gate; } });
+  const { fixture, request, calls } = await setup(t, { async nameSet() { entered(); await gate; } });
   const url = `/api/threads/${fixture.ids[0]}/inherit`;
   const pending = request(url, 'POST', { prompt: '交接内容' });
   await started;
@@ -269,7 +267,8 @@ test('继承读取最新模型和推理配置，忽略客户端伪造值与安�
     approvalPolicy: 'never', permissions: ':danger-full-access',
     collaborationMode: { mode: 'default', settings: { model: 'gpt-6-sol', reasoning_effort: 'ultra', developer_instructions: null } },
   });
-  assert.ok(calls.findIndex(call => call.method === 'thread/settings/update') < calls.findIndex(call => call.method === 'thread/inject_items'));
+  assert.ok(calls.findIndex(call => call.method === 'thread/settings/update') < calls.findIndex(call => call.method === 'thread/unsubscribe'));
+  assert.ok(!calls.some(call => call.method === 'thread/inject_items'));
   const stored = (await request(`/api/threads/${result.body.thread.id}/inheritance`)).body;
   assert.equal(stored.settings.model, 'gpt-6-sol');
   assert.equal(stored.settings.reasoningEffort, 'ultra');

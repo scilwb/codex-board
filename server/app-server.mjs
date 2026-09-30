@@ -4,11 +4,11 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 
-export function codexBinary() {
-  if (process.env.CODEX_BOARD_CODEX_BIN) return process.env.CODEX_BOARD_CODEX_BIN;
-  const extensions = join(homedir(), '.vscode', 'extensions');
+export function codexBinary({ extensions = join(homedir(), '.vscode', 'extensions'), override = process.env.CODEX_BOARD_CODEX_BIN } = {}) {
+  if (override) return override;
   if (existsSync(extensions)) {
-    const candidates = readdirSync(extensions).filter(name => name.startsWith('openai.chatgpt-')).sort().reverse();
+    const candidates = readdirSync(extensions).filter(name => name.startsWith('openai.chatgpt-'))
+      .sort((a, b) => b.localeCompare(a, 'en', { numeric: true }));
     for (const candidate of candidates) {
       const binary = join(extensions, candidate, 'bin', `linux-${process.arch === 'x64' ? 'x86_64' : process.arch}`, 'codex');
       if (existsSync(binary)) return binary;
@@ -19,9 +19,10 @@ export function codexBinary() {
 
 /** Local metadata/history client. Never submits turn/start or inference. */
 export class AppServerClient {
-  constructor({ codexHome, binary = codexBinary(), timeoutMs = 45000, idleTimeoutMs = 30000 } = {}) {
+  constructor({ codexHome, binary, resolveBinary = codexBinary, timeoutMs = 45000, idleTimeoutMs = 30000 } = {}) {
     this.codexHome = codexHome;
     this.binary = binary;
+    this.resolveBinary = resolveBinary;
     this.timeoutMs = timeoutMs;
     this.idleTimeoutMs = idleTimeoutMs;
     this.pending = new Map();
@@ -40,7 +41,9 @@ export class AppServerClient {
   }
 
   async initialize() {
-    const child = spawn(this.binary, ['app-server', '--listen', 'stdio://'], {
+    // VS Code replaces extension directories during upgrades. Resolve the
+    // installed binary at each launch instead of pinning the service-start path.
+    const child = spawn(this.binary ?? this.resolveBinary(), ['app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, CODEX_HOME: this.codexHome },
     });

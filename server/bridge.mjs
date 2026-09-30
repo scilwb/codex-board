@@ -1,13 +1,14 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
+import { CodexIpcClient } from './codex-ipc.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const failure = (message, status = 400) => Object.assign(new Error(message), { status });
 
 /** Local, authenticated editor bridge. Only validated thread IDs can be opened. */
 export class EditorBridge {
-  constructor({ dataDir, timeoutMs = 12000, staleMs = 35000, pollMs = 20000 } = {}) {
+  constructor({ dataDir, codexHome, ipcClient, timeoutMs = 12000, staleMs = 35000, pollMs = 20000 } = {}) {
     const path = join(dataDir, 'bridge-token');
     if (!existsSync(path)) writeFileSync(path, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' });
     chmodSync(path, 0o600);
@@ -18,6 +19,7 @@ export class EditorBridge {
     this.pollMs = pollMs;
     this.clients = new Map();
     this.commands = new Map();
+    this.ipc = ipcClient || new CodexIpcClient({ codexHome });
   }
 
   authenticate(value) {
@@ -134,7 +136,22 @@ export class EditorBridge {
     return { accepted: true };
   }
 
+  async submitInheritance(threadId, { windowId, ...submission } = {}) {
+    let opened;
+    try {
+      opened = await this.open(threadId, windowId);
+    } catch (error) {
+      // Navigation has not dispatched a model request. Retrying the existing
+      // child is safe even if VS Code's window acknowledgement was lost.
+      error.dispatched = false;
+      throw error;
+    }
+    const sent = await this.ipc.submitInheritance(threadId, submission);
+    return { ...opened, ...sent };
+  }
+
   close() {
+    this.ipc.close();
     for (const pending of this.commands.values()) { clearTimeout(pending.timer); pending.reject(failure('服务正在重启，请稍后重试', 503)); }
     this.commands.clear();
     for (const client of this.clients.values()) client.waiter?.(null);

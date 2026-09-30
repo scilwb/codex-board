@@ -11,6 +11,8 @@ import { makeFixture } from './fixture.mjs';
 const fixture = makeFixture();
 const calls = [];
 const opened = [];
+const sent = [];
+const sendReceipts = new Map();
 const inheritBodies = [];
 const errors = [];
 const results = [];
@@ -29,10 +31,14 @@ appendFileSync(pathFor(sourceId), JSON.stringify({ timestamp: new Date().toISOSt
   collaboration_mode: { mode: sourceSettings.collaborationMode, settings: { model: sourceSettings.model, reasoning_effort: sourceSettings.reasoningEffort, developer_instructions: null } },
 } }) + '\n');
 const sourceBefore = readFileSync(pathFor(sourceId), 'utf8');
-let failNextInjection = false;
+let connectedWindows = [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', title: '虚构的实验工作区', folders: [fixture.cwd], openThreads: [] }];
+let failNextSetup = false;
 let failNextOpen = false;
-let injectionGate = null;
-let releaseInjection = null;
+let failAfterSend = false;
+let creationGate = null;
+let releaseCreation = null;
+let sendGate = null;
+let releaseSend = null;
 let releasePreview = null;
 const appServer = { async request(method, params) {
   calls.push({ method, params });
@@ -59,12 +65,8 @@ const appServer = { async request(method, params) {
     assert.equal(params.model, sourceSettings.model);
     assert.equal(params.effort, sourceSettings.reasoningEffort);
     assert.deepEqual(params.collaborationMode, { mode: sourceSettings.collaborationMode, settings: { model: sourceSettings.model, reasoning_effort: sourceSettings.reasoningEffort, developer_instructions: null } });
-    return {};
-  }
-  if (method === 'thread/inject_items') {
-    if (failNextInjection) { failNextInjection = false; throw new Error('模拟交接上下文注入失败'); }
-    if (injectionGate) await injectionGate;
-    for (const item of params.items) appendFileSync(pathFor(params.threadId), JSON.stringify({ type: 'response_item', payload: item }) + '\n');
+    if (failNextSetup) { failNextSetup = false; throw new Error('模拟来源配置保存失败'); }
+    if (creationGate) await creationGate;
     return {};
   }
   if (method === 'thread/unsubscribe') return {};
@@ -75,11 +77,31 @@ const appServer = { async request(method, params) {
   throw new Error(`Unexpected operation; model execution is forbidden in this fixture: ${method}`);
 } };
 const bridge = {
-  windows: () => [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', title: '虚构的实验工作区', folders: [fixture.cwd], openThreads: [] }],
+  windows: () => connectedWindows,
   async open(id, windowId) {
     opened.push({ id, windowId });
-    if (failNextOpen) { failNextOpen = false; throw new Error('模拟 VS Code 打开失败'); }
+    if (failNextOpen) { failNextOpen = false; throw Object.assign(new Error('模拟 VS Code 打开失败'), { dispatched: false }); }
     return { opened: true, editorOpened: true, verified: true, reused: false };
+  },
+  async submitInheritance(id, options) {
+    const navigation = await this.open(id, options.windowId);
+    if (sendGate) await sendGate;
+    if (sendReceipts.has(options.submissionId)) return { ...navigation, ...sendReceipts.get(options.submissionId), alreadySubmitted: true };
+    assert.equal(options.settings.model, sourceSettings.model);
+    assert.equal(options.settings.reasoningEffort, sourceSettings.reasoningEffort);
+    assert.equal(options.settings.cwd, fixture.cwd);
+    sent.push({ id, ...options });
+    const turnId = randomUUID();
+    appendFileSync(pathFor(id), [
+      { type: 'user_message', message: options.prompt },
+      { type: 'task_started', turn_id: turnId },
+      { type: 'agent_message', phase: 'final_answer', message: '已理解虚构交接资料，等待下一条指令。' },
+      { type: 'task_complete', turn_id: turnId, last_agent_message: '已理解虚构交接资料，等待下一条指令。' },
+    ].map(payload => JSON.stringify({ type: 'event_msg', payload }) + '\n').join(''));
+    const receipt = { submitted: true, verified: true, turnId };
+    sendReceipts.set(options.submissionId, receipt);
+    if (failAfterSend) { failAfterSend = false; throw Object.assign(new Error('模拟已发送但回执丢失'), { dispatched: true }); }
+    return { ...navigation, ...receipt };
   },
   close() {},
 };
@@ -170,11 +192,12 @@ try {
     assert.equal(editedPrompt.length, promptLimit);
     await expect(page.getByTestId('inherit-prompt-count')).toHaveText(`${promptLimit} / ${promptLimit}`);
     await expect(page.getByTestId('modal-submit')).toBeEnabled();
-    await expect(page.getByTestId('thread-modal')).toContainText('发送下一条消息即可继续');
+    await expect(page.getByTestId('thread-modal')).toContainText('自动发送下方提示词');
+    await expect(page.getByTestId('thread-modal')).toContainText('思考状态和继承确认回复');
     await page.screenshot({ path: 'artifacts/ui-inheritance-modal.png', fullPage: true });
   });
-  await check('注入失败保留编辑内容，重试期间禁止重复创建', async () => {
-    failNextInjection = true;
+  await check('来源配置保存失败保留编辑内容，重试期间禁止重复创建，成功后发送可见首条消息', async () => {
+    failNextSetup = true;
     await page.getByTestId('modal-submit').click();
     await expect(page.getByTestId('modal-error')).toContainText('已归档');
     await expect(page.getByTestId('modal-title')).toHaveValue(editedTitle);
@@ -184,20 +207,31 @@ try {
     assert.equal(calls.filter(call => call.method === 'thread/archive').length, 1);
     assert.equal(opened.length, 0);
     assert.equal(readFileSync(pathFor(sourceId), 'utf8'), sourceBefore);
-    injectionGate = new Promise(resolve => { releaseInjection = resolve; });
+    creationGate = new Promise(resolve => { releaseCreation = resolve; });
     await page.getByTestId('modal-submit').click();
-    await expect.poll(() => calls.filter(call => call.method === 'thread/inject_items').length).toBe(2);
+    await expect.poll(() => calls.filter(call => call.method === 'thread/settings/update').length).toBe(2);
     await expect(page.getByTestId('modal-submit')).toBeDisabled();
     await expect(page.getByTestId('modal-cancel')).toBeDisabled();
     await expect(page.getByTestId('inherit-prompt')).toBeDisabled();
     await page.getByTestId('thread-modal').locator('form').evaluate(form => form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
     assert.equal(starts(), 2);
-    releaseInjection(); injectionGate = null;
+    sendGate = new Promise(resolve => { releaseSend = resolve; });
+    releaseCreation(); creationGate = null;
     await expect(page.getByTestId('thread-modal')).toHaveCount(0);
     await expect.poll(() => opened.length).toBe(1);
     firstCreatedId = await page.getByTestId('detail-thread-id').textContent();
     assert.notEqual(firstCreatedId, sourceId);
     assert.equal(opened[0].id, firstCreatedId);
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('正在向 VS Code 发送');
+    await expect(page.getByTestId('inheritance-start')).toBeDisabled();
+    assert.equal(sent.length, 0);
+    releaseSend(); sendGate = null;
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('交接提示词已发送');
+    await expect(page.getByTestId('inheritance-start')).toHaveCount(0);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].id, firstCreatedId);
+    assert.equal(sent[0].prompt, editedPrompt);
+    assert.ok(readFileSync(pathFor(firstCreatedId), 'utf8').includes('已理解虚构交接资料'));
     const created = server.board.snapshot().threads.find(thread => thread.id === firstCreatedId);
     assert.equal(created.forkedFromId, null);
     assert.equal(created.inheritedFromId, sourceId);
@@ -208,7 +242,7 @@ try {
     assert.equal(calls.filter(call => call.method === 'thread/settings/update').length, 2);
     assert.deepEqual(Object.keys(inheritBodies.at(-1)).sort(), ['cwd', 'projectId', 'prompt', 'requestId', 'taskId', 'title']);
     await expect(page.getByTestId('detail-inherited-from')).toHaveText(sourceId);
-    await expect(page.getByTestId('inheritance-context')).toContainText('交接上下文已载入');
+    await expect(page.getByTestId('inheritance-context')).toContainText('在 VS Code 查看思考和回复');
     await page.screenshot({ path: 'artifacts/ui-inheritance-created.png', fullPage: true });
   });
   await check('继承关系区别于 Fork，可查看来源且不能删除', async () => {
@@ -248,16 +282,17 @@ try {
     assert.equal(inheritanceRequests, 2);
     await expect(page.getByTestId('inheritance-settings-model')).toHaveText(sourceSettings.model);
   });
-  await check('自动打开失败时保留新卡，重试打开不重复创建', async () => {
+  await check('打开失败保留新卡，重试同一条对话；回执丢失先核对，提示词原文只发送一次', async () => {
     await selectThread(sourceId);
     await page.getByTestId('detail-inherit').click();
     await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
     await page.getByTestId('modal-title').fill('虚构的续聊 · 手动定位');
-    await page.getByTestId('inherit-prompt').fill('仅继续检查采集日志。');
+    const exactPrompt = '  仅继续检查采集日志。\n';
+    await page.getByTestId('inherit-prompt').fill(exactPrompt);
     failNextOpen = true;
     await page.getByTestId('modal-submit').click();
     await expect(page.getByTestId('thread-modal')).toHaveCount(0);
-    await expect(page.getByTestId('toast')).toContainText('打开失败');
+    await expect(page.getByTestId('toast')).toContainText('交接提示词未确认发送');
     const secondCreatedId = await page.getByTestId('detail-thread-id').textContent();
     assert.notEqual(secondCreatedId, sourceId);
     assert.notEqual(secondCreatedId, firstCreatedId);
@@ -265,11 +300,63 @@ try {
     const attempts = starts();
     assert.equal(attempts, 3);
     assert.equal(opened.at(-1).id, secondCreatedId);
-    await page.getByTestId('detail-open').click();
-    await expect(page.getByTestId('toast')).toContainText('已打开');
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('发送交接提示词失败');
+    await expect(page.getByTestId('inheritance-submission-error')).toContainText('模拟 VS Code 打开失败');
+    failAfterSend = true;
+    await page.getByTestId('inheritance-start').click();
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('发送结果尚未确认');
+    await expect(page.getByTestId('inheritance-submission-error')).toContainText('模拟已发送但回执丢失');
+    assert.equal(sent.filter(item => item.id === secondCreatedId).length, 1);
+    assert.equal(sent.at(-1).prompt, exactPrompt);
+    await page.getByTestId('inheritance-start').click();
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('交接提示词已发送');
+    await expect(page.getByTestId('toast')).toContainText('交接提示词已发送');
+    assert.equal(sent.filter(item => item.id === secondCreatedId).length, 1);
     assert.equal(opened.at(-1).id, secondCreatedId);
     assert.equal(starts(), attempts);
     assert.equal(server.board.snapshot().threads.length, 5);
+  });
+  await check('多个窗口先选择目标，取消后保留待发送对话，选择后只发送一次', async () => {
+    connectedWindows = [...connectedWindows, { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', title: '虚构的第二窗口', folders: [fixture.cwd], openThreads: [] }];
+    await page.evaluate(() => localStorage.removeItem('codex-board.window-targets'));
+    await page.reload();
+    await selectThread(sourceId);
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    await page.getByTestId('inherit-prompt').fill('请确认理解交接资料，然后等待。');
+    const sendCount = sent.length;
+    await page.getByTestId('modal-submit').click();
+    await expect(page.getByTestId('window-picker')).toContainText('在哪个窗口发送并打开？');
+    const childId = await page.getByTestId('detail-thread-id').textContent();
+    assert.equal(sent.length, sendCount);
+    await page.getByTestId('window-picker').getByRole('button', { name: '取消' }).click();
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('交接提示词尚未发送');
+    await expect(page.getByTestId('inheritance-start')).toBeEnabled();
+    const creationCount = starts();
+    await page.getByTestId('inheritance-start').click();
+    await expect(page.getByTestId('window-picker')).toBeVisible();
+    await page.getByTestId('window-option-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb').check();
+    await page.getByTestId('window-picker-open').click();
+    await expect(page.getByTestId('window-picker')).toHaveCount(0);
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('交接提示词已发送');
+    assert.equal(sent.length, sendCount + 1);
+    assert.equal(sent.at(-1).id, childId);
+    assert.equal(sent.at(-1).windowId, connectedWindows[1].id);
+    assert.equal(starts(), creationCount);
+    connectedWindows = connectedWindows.slice(0, 1);
+  });
+  await check('旧版继承显示补发说明，打开已有对话不会自动再发送', async () => {
+    const managed = server.board.store.state.managedThreads[firstCreatedId];
+    const { submission, ...legacyHandoff } = managed.inheritance;
+    server.board.store.remember({ ...managed, inheritance: legacyHandoff });
+    const sendCount = sent.length;
+    await page.reload();
+    await selectThread(firstCreatedId);
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('已继续交流的对话无需补发');
+    await expect(page.getByTestId('inheritance-start')).toHaveText('发送交接并打开');
+    await page.getByTestId('detail-open').click();
+    await expect(page.getByTestId('toast')).toContainText('已打开');
+    assert.equal(sent.length, sendCount);
   });
   await check('交接预览读取失败可重试，取消后旧请求不会污染下一张卡', async () => {
     const otherId = fixture.ids[1];
@@ -408,14 +495,14 @@ try {
     assert.equal(calls.some(call => call.method === 'turn/start' || call.method === 'thread/fork'), false);
     assert.deepEqual(errors, []);
   });
-  writeFileSync('artifacts/ui-inheritance-results.json', JSON.stringify({ environment: 'Isolated fictional fixture; injected metadata client; no model turns', results, errors }, null, 2));
+  writeFileSync('artifacts/ui-inheritance-results.json', JSON.stringify({ environment: 'Isolated fictional fixture; metadata client and simulated visible native send; no real model calls', results, errors }, null, 2));
 } catch (error) {
   if (page) await page.screenshot({ path: 'artifacts/ui-inheritance-failure.png', fullPage: true }).catch(() => {});
   console.error(error);
   console.error('Browser errors:', errors);
   process.exitCode = 1;
 } finally {
-  releaseInjection?.(); releasePreview?.();
+  releaseCreation?.(); releaseSend?.(); releasePreview?.();
   await browser?.close();
   server.board.closeStreams();
   const closed = once(server, 'close'); server.close(); server.closeAllConnections(); await closed;

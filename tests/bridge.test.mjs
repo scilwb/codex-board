@@ -32,6 +32,36 @@ test('桥接：等待窗口实际确认，重复点击合并为一个命令', as
   assert.equal(bridge.clients.get(window.id).pending, null);
 });
 
+test('继承发送先等待目标窗口确认，再由原生对话所有者接收提示词', async t => {
+  const submissions = [];
+  const ipcClient = {
+    async submitInheritance(threadId, body) {
+      submissions.push({ threadId, body });
+      return { submitted: true, verified: true, turnId: randomUUID() };
+    }, close() {},
+  };
+  const { f, bridge, window } = setup(t, { ipcClient });
+  const body = { windowId: window.id, prompt: '验证交接内容', submissionId: randomUUID(), settings: { model: 'gpt-6.1-sol', reasoningEffort: 'ultra' } };
+  const starting = bridge.submitInheritance(f.ids[0], body);
+  const { command } = await bridge.poll(window.id);
+  assert.equal(submissions.length, 0, 'no inference before the editor confirms navigation');
+  bridge.result({ clientId: window.id, commandId: command.id, status: 'opened', windowFocused: true });
+  const result = await starting;
+  assert.equal(result.opened, true);
+  assert.equal(result.submitted, true);
+  assert.equal(result.verified, true);
+  assert.deepEqual(submissions, [{ threadId: f.ids[0], body: { prompt: body.prompt, submissionId: body.submissionId, settings: body.settings } }]);
+});
+
+test('继承定位失败不会发送提示词，也不会把打开当作发送成功', async t => {
+  const ipcClient = { async submitInheritance() { throw new Error('must not send'); }, close() {} };
+  const { f, bridge, window } = setup(t, { ipcClient });
+  const failed = bridge.submitInheritance(f.ids[0], { windowId: window.id, prompt: '测试', submissionId: randomUUID() });
+  const { command } = await bridge.poll(window.id);
+  bridge.result({ clientId: window.id, commandId: command.id, status: 'error', message: '无法打开目标标签' });
+  await assert.rejects(failed, error => error.dispatched === false && /无法打开目标/.test(error.message));
+});
+
 test('桥接：不可用窗口超时后不给编辑器堆积重试', async t => {
   const { f, bridge, window } = setup(t, { timeoutMs: 30 });
   await assert.rejects(bridge.open(f.ids[0], window.id), error => error.status === 504 && /1 秒/.test(error.message));

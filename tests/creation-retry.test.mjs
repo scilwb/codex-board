@@ -41,7 +41,7 @@ async function setup(t, options = {}) {
   return { fixture, calls, post, store: () => server.board.store, restart: async () => { await stop(); await start(); } };
 }
 
-test('新建、Fork、继承丢响应后的同请求重试返回原 ID，不重复创建或注入', async t => {
+test('新建、Fork、继承丢响应后的同请求重试返回原 ID，不重复创建', async t => {
   const { fixture, post, calls } = await setup(t);
   for (const kind of ['new', 'fork', 'inherit']) {
     const path = kind === 'new' ? '/api/threads' : `/api/threads/${fixture.ids[0]}/${kind}`;
@@ -57,7 +57,7 @@ test('新建、Fork、继承丢响应后的同请求重试返回原 ID，不重�
     assert.equal(changed.status, 409);
     assert.equal(calls.length, before);
   }
-  assert.equal(calls.filter(call => call.method === 'thread/inject_items').length, 1);
+  assert.equal(calls.filter(call => call.method === 'thread/inject_items').length, 0);
 });
 
 test('并发的同一创建请求合并等待，其他请求不会创建第二条对话', async t => {
