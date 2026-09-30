@@ -9,6 +9,7 @@ import { AppServerClient } from './app-server.mjs';
 import { EditorBridge } from './bridge.mjs';
 import { GitBranches } from './git.mjs';
 import { HANDOFF_PROMPT_LIMIT } from './handoff.mjs';
+import { DesktopNotifications } from './desktop-notifications.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const MAX_BODY = 1024 * 1024;
@@ -92,6 +93,7 @@ export function createServer(options = {}) {
   const store = new BoardStore({ codexHome, dataDir });
   const appServer = options.appServer || new AppServerClient({ codexHome, binary: options.codexBinary });
   const bridge = options.bridge || new EditorBridge({ dataDir, ...options.bridgeOptions });
+  const desktopNotifications = options.desktopNotifications || new DesktopNotifications({ dataDir, onOpen: threadId => bridge.open(threadId) });
   const branches = options.branches || new GitBranches();
   const creationRequests = new Map();
   const clients = new Set();
@@ -103,8 +105,10 @@ export function createServer(options = {}) {
   function snapshot() {
     let threads = [], error;
     try { threads = store.threads(); } catch (problem) { error = problem.message; }
+    if (!error) desktopNotifications.observe(threads);
     return {
       threads,
+      desktopNotifications: desktopNotifications.status(),
       graph: store.graph(new Set(threads.map(thread => thread.id))),
       organization: store.organization(),
       capabilities: { create: !options.disableActions, fork: !options.disableActions, inherit: !options.disableActions, openVscode: !options.disableOpen },
@@ -254,6 +258,21 @@ export function createServer(options = {}) {
       }
 
       if (request.method === 'GET' && pathname === '/api/snapshot') return json(response, 200, snapshot());
+      if (request.method === 'GET' && pathname === '/api/notifications') return json(response, 200, desktopNotifications.status());
+      if (request.method === 'PATCH' && pathname === '/api/notifications') {
+        const body = await readJson(request);
+        if (typeof body.enabled !== 'boolean') throw fail('请选择开启或关闭桌面通知');
+        snapshot(); // Record activity while muted before enabling; never replay it.
+        await desktopNotifications.setEnabled(body.enabled);
+        broadcast(true);
+        return json(response, 200, desktopNotifications.status());
+      }
+      if (request.method === 'POST' && pathname === '/api/notifications/test') {
+        await readJson(request);
+        await desktopNotifications.test();
+        broadcast(true);
+        return json(response, 200, { ok: true, ...desktopNotifications.status() });
+      }
       if (pathname.startsWith('/api/bridge/')) {
         bridge.authenticate(request.headers['x-codex-board-token']);
         if (request.method === 'POST' && pathname === '/api/bridge/register') {
@@ -367,6 +386,7 @@ export function createServer(options = {}) {
   });
 
   const timer = setInterval(broadcast, options.pollIntervalMs || 2000);
+  server.once('listening', () => snapshot());
   timer.unref();
   const heartbeat = setInterval(() => { for (const client of clients) client.write(': keepalive\n\n'); }, 20000);
   heartbeat.unref();
@@ -374,9 +394,9 @@ export function createServer(options = {}) {
     closed = true;
     clearInterval(timer); clearInterval(heartbeat);
     for (const client of clients) client.end();
-    clients.clear(); bridge.close(); store.close(); appServer.stop?.();
+    clients.clear(); desktopNotifications.close(); bridge.close(); store.close(); appServer.stop?.();
   });
-  server.board = { snapshot, store, appServer, bridge, broadcast, closeStreams() { for (const client of clients) client.end(); bridge.close(); } };
+  server.board = { snapshot, store, appServer, bridge, desktopNotifications, broadcast, closeStreams() { for (const client of clients) client.end(); bridge.close(); } };
   return server;
 }
 

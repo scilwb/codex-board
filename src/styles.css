@@ -198,6 +198,12 @@ button { color: inherit; }
 .activity-toggle:hover { background: #f7f9f4; }
 .activity-toggle strong { margin-left: auto; font-size: 9px; font-weight: 400; }
 .activity-toggle[aria-pressed="true"] strong { color: #618652; }
+.activity-toggle:disabled { opacity: .65; cursor: wait; }
+.desktop-notifications { flex-shrink: 0; }
+.desktop-notification-help { display: flex; align-items: flex-start; gap: 8px; padding: 0 7px 9px; color: #899381; font-size: 9px; line-height: 1.5; }
+.desktop-notification-help span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.desktop-notification-help button { flex-shrink: 0; border: 0; border-radius: 4px; padding: 1px 5px; background: #edf3e8; color: #557444; font-size: 9px; cursor: pointer; }
+.desktop-notification-help button:disabled { opacity: .5; cursor: wait; }
 .detail-activity { padding: 11px 12px; border: 1px solid var(--status-border); border-radius: 8px; background: var(--status-tint); }
 .detail-activity .activity-badge { font-size: 10px; }
 .detail-activity p { font-size: 10px; line-height: 1.7; margin: 7px 0 0; color: #65758a; overflow-wrap: anywhere; }

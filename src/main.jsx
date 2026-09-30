@@ -111,6 +111,8 @@ function App() {
   const [toast, setToast] = useState(null);
   const [activityNotices, setActivityNotices] = useState([]);
   const [activityNotifications, setActivityNotifications] = useState(() => { try { return localStorage.getItem('codex-board.activity-notifications') !== 'off'; } catch { return true; } });
+  const [desktopNotificationBusy, setDesktopNotificationBusy] = useState(false);
+  const desktopNotificationRequest = useRef(false);
   const [workspaceOptions, setWorkspaceOptions] = useState([]);
   const [saving, setSaving] = useState(false);
   const [clockMinute, setClockMinute] = useState(() => Math.floor(Date.now() / 60_000));
@@ -189,6 +191,22 @@ function App() {
     setActivityNotifications(enabled);
     if (!enabled) setActivityNotices([]);
     try { localStorage.setItem('codex-board.activity-notifications', enabled ? 'on' : 'off'); } catch { /* Browser storage may be disabled. */ }
+  };
+
+  const desktopNotifications = snapshot.desktopNotifications;
+  const updateDesktopNotifications = async (test = false) => {
+    if (desktopNotificationRequest.current) return;
+    desktopNotificationRequest.current = true;
+    setDesktopNotificationBusy(true);
+    try {
+      await api(test ? '/api/notifications/test' : '/api/notifications', {
+        method: test ? 'POST' : 'PATCH',
+        body: JSON.stringify(test ? {} : { enabled: !desktopNotifications?.enabled }),
+      });
+      await refreshSnapshot();
+      if (test) notify('已发送系统测试通知，请查看桌面顶部或通知中心。');
+    } catch (err) { notify(`桌面通知：${err.message}`, 'error'); }
+    finally { desktopNotificationRequest.current = false; if (mounted.current) setDesktopNotificationBusy(false); }
   };
 
   useEffect(() => {
@@ -533,7 +551,11 @@ function App() {
           {visibleThreads.map((thread) => <button className={`thread-list-item ${thread.id === selectedThreadId ? 'selected' : ''}`} data-status={activityPresentation(thread).status} key={thread.id} title={`${titleOf(thread)}\n${activityPresentation(thread).label}\n${thread.id}`} onClick={() => focusThread(thread)} data-testid={`thread-list-${thread.id}`}><span className={`list-thread-dot ${activityPresentation(thread).status}`} aria-hidden="true" /><span className="list-thread-text"><strong>{titleOf(thread)}</strong><small><span className="list-thread-status">{activityPresentation(thread).label}</span> · {relativeTime(thread.updatedAt)}</small></span></button>)}
           {!loading && !visibleThreads.length && <p className="sidebar-empty">{search ? '没有匹配的对话' : '暂无对话'}</p>}
         </div>
-        <button className="activity-toggle" aria-pressed={activityNotifications} title="需你处理或本轮结束时显示页内提示" onClick={toggleActivityNotifications} data-testid="activity-notifications-toggle">{activityNotifications ? <Bell size={13} /> : <BellOff size={13} />}<span>状态提示</span><strong>{activityNotifications ? '开启' : '关闭'}</strong></button>
+        <button className="activity-toggle" aria-pressed={activityNotifications} title="需你处理或本轮结束时显示页内提示" onClick={toggleActivityNotifications} data-testid="activity-notifications-toggle">{activityNotifications ? <Bell size={13} /> : <BellOff size={13} />}<span>页内提示</span><strong>{activityNotifications ? '开启' : '关闭'}</strong></button>
+        {desktopNotifications && <div className="desktop-notifications">
+          <button className="activity-toggle" aria-pressed={desktopNotifications.enabled} disabled={desktopNotificationBusy} title="需要你回答或本轮结束时发送系统桌面通知，离开看板仍可收到" onClick={() => updateDesktopNotifications()} data-testid="desktop-notifications-toggle">{desktopNotifications.enabled ? <Bell size={13} /> : <BellOff size={13} />}<span>桌面通知</span><strong>{desktopNotificationBusy ? '处理中…' : desktopNotifications.enabled ? '开启' : '关闭'}</strong></button>
+          <div className="desktop-notification-help"><span data-testid="desktop-notifications-status">{desktopNotifications.lastError || (desktopNotifications.available === false ? '系统通知暂不可用' : desktopNotifications.enabled ? '切换页面、关闭看板仍会提醒' : '需要你回答 · 本轮结束')}</span><button disabled={desktopNotificationBusy} onClick={() => updateDesktopNotifications(true)} data-testid="desktop-notifications-test">测试</button></div>
+        </div>}
         <div className="sidebar-footer"><span className={`sync-indicator ${connected ? 'connected' : ''}`} /><span data-testid="sync-status">{loading ? '正在读取…' : connected ? '本机同步已连接' : '同步连接已断开，重试中'}</span>{(saving || organizationSaving) && <LoaderCircle size={12} className="spin" aria-label="正在保存" />}</div>
       </aside>
 
