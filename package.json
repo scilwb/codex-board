@@ -13,7 +13,7 @@
     "build": "vite build",
     "start": "node server/index.mjs",
     "test": "node --test tests/*.test.mjs server/*.test.mjs vscode-bridge/*.test.cjs",
-    "test:ui": "node tests/ui.mjs && node tests/ui-organization.mjs && node tests/ui-activity.mjs && node tests/ui-desktop-notifications.mjs && node tests/ui-inheritance.mjs && node tests/ui-resilience.mjs"
+    "test:ui": "node tests/ui.mjs && node tests/ui-organization.mjs && node tests/ui-activity.mjs && node tests/ui-desktop-notifications.mjs && node tests/ui-inheritance.mjs && node tests/ui-resilience.mjs && node tests/ui-prompts.mjs"
   },
   "dependencies": {
     "@xyflow/react": "^12.8.5",

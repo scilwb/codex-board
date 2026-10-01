@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   ReactFlow, Background, Controls, Handle, Position, MarkerType, BaseEdge,
@@ -7,7 +7,7 @@ import {
 import {
   ArrowUpRight, Check, ChevronDown, Copy, FolderOpen, GitBranch,
   GitFork, Link2, LoaderCircle, Map as MapIcon, Plus, Search, Trash2, X, Pencil, Layers,
-  Bell, BellOff, MessageSquare, RefreshCw, ArrowRightToLine,
+  Bell, BellOff, MessageSquare, RefreshCw, ArrowRightToLine, Library,
 } from 'lucide-react';
 import '@xyflow/react/dist/style.css';
 import { routeAroundCards } from './edgeRouting.js';
@@ -18,6 +18,20 @@ const RELATIONS = { serial: '串行', parallel: '并行', reference: '参考' };
 const HANDOFF_PROMPT_LIMIT = 24_000;
 const emptyGraph = { positions: {}, edges: [] };
 const emptyOrganization = { projects: [], tasks: [], assignments: {} };
+const PromptLibrary = lazy(() => import('./PromptLibrary.jsx'));
+
+class PromptLibraryBoundary extends React.Component {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return <div className="modal-overlay"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="prompts-load-error">
+      <h2 id="prompts-load-error">提示词库暂时无法打开</h2>
+      <p className="modal-description">页面文件可能已更新，请刷新看板后重新打开。</p>
+      <div className="modal-actions"><button className="secondary-button" onClick={this.props.onClose}>关闭</button><button className="primary-button" onClick={() => window.location.reload()}>刷新看板</button></div>
+    </section></div>;
+  }
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -28,6 +42,7 @@ async function api(path, options = {}) {
   try { body = await response.json(); } catch { body = {}; }
   if (!response.ok) {
     const error = new Error(body.error || body.message || `请求失败（${response.status}）`);
+    error.status = response.status;
     error.submission = body.submission;
     error.threadId = body.threadId;
     throw error;
@@ -103,6 +118,7 @@ function App() {
   const [selectedTask, setSelectedTask] = useState('');
   const [folder, setFolder] = useState('');
   const [organizationModal, setOrganizationModal] = useState(null);
+  const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
   const [organizationSaving, setOrganizationSaving] = useState(false);
   const [branch, setBranch] = useState('');
   const [search, setSearch] = useState('');
@@ -148,6 +164,18 @@ function App() {
     setToast({ message, kind });
     toastTimer.current = setTimeout(() => setToast(null), kind === 'error' ? 6500 : 3200);
   }, []);
+
+  useEffect(() => {
+    const openLibrary = (event) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== 'k' || event.repeat || promptLibraryOpen || modal || organizationModal || windowPicker) return;
+      const target = event.target;
+      if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, [contenteditable="true"]'))) return;
+      event.preventDefault();
+      setPromptLibraryOpen(true);
+    };
+    window.addEventListener('keydown', openLibrary);
+    return () => window.removeEventListener('keydown', openLibrary);
+  }, [promptLibraryOpen, modal, organizationModal, windowPicker]);
 
   const receiveSnapshot = useCallback((next) => {
     if (!next || !Array.isArray(next.threads)) return;
@@ -552,6 +580,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand"><span className="brand-mark"><MapIcon size={21} strokeWidth={1.65} /></span><div><strong>Codex Board</strong><span>对话地图</span></div></div>
         <button className="new-thread-button" onClick={openNew} disabled={loading || snapshot.capabilities.create === false} data-testid="new-thread"><Plus size={16} /> 新建对话</button>
+        <button className="prompt-library-entry" onClick={() => setPromptLibraryOpen(true)} title="提示词库（Ctrl / ⌘ + K）" data-testid="prompts-open"><Library size={15} /><span>提示词库</span><kbd>Ctrl K</kbd></button>
         <div className="sidebar-section-label"><span>项目 · 研究方向</span><div className="section-actions"><button className="icon-button" title="管理项目和任务" aria-label="管理项目和任务" data-testid="manage-organization" onClick={() => setOrganizationModal({ projectId: selectedProject })}><Pencil size={12} /></button><button className="icon-button" title="新建项目" aria-label="新建项目" data-testid="add-project" onClick={() => setOrganizationModal({ action: 'createProject' })}><Plus size={14} /></button></div></div>
         <nav className="project-list" aria-label="项目">
           <button className={`project-item ${selectedProject === '' ? 'selected' : ''}`} onClick={() => chooseProject('')} data-testid="project-all"><Layers size={15} /><span>全部项目</span><em>{threads.length}</em></button>
@@ -606,6 +635,7 @@ function App() {
       {modal && <ThreadModal key={`${modal.kind}:${modal.thread?.id || 'new'}`} modal={modal} folders={workspaceOptions.length ? workspaceOptions : folders} organization={organization} onClose={() => setModal(null)} onCreated={onCreated} />}
       {organizationModal && <OrganizationModal initial={organizationModal} organization={organization} onClose={() => setOrganizationModal(null)} onSave={updateOrganization} />}
       {windowPicker && <WindowPicker picker={windowPicker} onClose={() => setWindowPicker(null)} onOpen={(thread, windowId, windowTitle) => launchThread(thread, windowId, windowTitle, windowPicker.startInheritance)} />}
+      {promptLibraryOpen && <PromptLibraryBoundary onClose={() => setPromptLibraryOpen(false)}><Suspense fallback={<div className="modal-overlay"><section className="modal" role="status"><p className="handoff-loading"><LoaderCircle size={16} className="spin" />正在打开提示词库…</p></section></div>}><PromptLibrary api={api} notify={notify} onClose={() => setPromptLibraryOpen(false)} /></Suspense></PromptLibraryBoundary>}
       {toast && <div className={`toast ${toast.kind}`} role="status" data-testid="toast">{toast.kind === 'success' ? <Check size={15} /> : <X size={15} />}{toast.message}</div>}
     </div>
   );

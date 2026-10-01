@@ -10,6 +10,7 @@ import { EditorBridge } from './bridge.mjs';
 import { GitBranches } from './git.mjs';
 import { HANDOFF_PROMPT_LIMIT } from './handoff.mjs';
 import { DesktopNotifications } from './desktop-notifications.mjs';
+import { PromptLibrary } from './prompt-library.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const MAX_BODY = 1024 * 1024;
@@ -19,13 +20,13 @@ const CREATION_ACCESS_SETTINGS = { approvalPolicy: 'never', permissions: ':dange
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8', '.woff2': 'font/woff2' };
 const fail = (message, status = 400) => Object.assign(new Error(message), { status });
 
-async function readJson(request) {
+async function readJson(request, limit = MAX_BODY) {
   if (!/^application\/json(?:;|$)/i.test(request.headers['content-type'] || '')) throw fail('请求必须使用 application/json', 415);
   let size = 0;
   const chunks = [];
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > MAX_BODY) throw fail('请求内容过大', 413);
+    if (size > limit) throw fail('请求内容过大', 413);
     chunks.push(chunk);
   }
   try {
@@ -91,6 +92,7 @@ export function createServer(options = {}) {
   const dataDir = options.dataDir || process.env.CODEX_BOARD_DATA_DIR || join(homedir(), '.local', 'share', 'codex-board');
   const distDir = resolve(options.distDir || join(ROOT, 'dist'));
   const store = new BoardStore({ codexHome, dataDir });
+  const promptLibrary = new PromptLibrary({ dataDir });
   const appServer = options.appServer || new AppServerClient({ codexHome, binary: options.codexBinary });
   const bridge = options.bridge || new EditorBridge({ dataDir, codexHome, ...options.bridgeOptions });
   const desktopNotifications = options.desktopNotifications || new DesktopNotifications({ dataDir, onOpen: threadId => bridge.open(threadId) });
@@ -330,6 +332,12 @@ export function createServer(options = {}) {
       }
 
       if (request.method === 'GET' && pathname === '/api/snapshot') return json(response, 200, snapshot());
+      if (request.method === 'GET' && pathname === '/api/prompts') return json(response, 200, promptLibrary.list());
+      if (request.method === 'POST' && pathname === '/api/prompts') return json(response, 201, promptLibrary.create(await readJson(request)));
+      if (request.method === 'POST' && pathname === '/api/prompts/import') return json(response, 200, promptLibrary.import(await readJson(request, 5 * 1024 * 1024)));
+      const promptMatch = pathname.match(/^\/api\/prompts\/([^/]+)$/);
+      if (request.method === 'PATCH' && promptMatch) return json(response, 200, promptLibrary.update(promptMatch[1], await readJson(request)));
+      if (request.method === 'DELETE' && promptMatch) return json(response, 200, promptLibrary.delete(promptMatch[1], await readJson(request)));
       if (request.method === 'GET' && pathname === '/api/notifications') return json(response, 200, desktopNotifications.status());
       if (request.method === 'PATCH' && pathname === '/api/notifications') {
         const body = await readJson(request);
@@ -471,7 +479,7 @@ export function createServer(options = {}) {
     for (const client of clients) client.end();
     clients.clear(); desktopNotifications.close(); bridge.close(); store.close(); appServer.stop?.();
   });
-  server.board = { snapshot, store, appServer, bridge, desktopNotifications, broadcast, closeStreams() { for (const client of clients) client.end(); bridge.close(); } };
+  server.board = { snapshot, store, promptLibrary, appServer, bridge, desktopNotifications, broadcast, closeStreams() { for (const client of clients) client.end(); bridge.close(); } };
   return server;
 }
 
