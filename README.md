@@ -74,11 +74,12 @@ node scripts/install-local.mjs
 ./scripts/launch.sh
 ```
 
-安装器创建本机桥接、用户服务和应用菜单入口，不设置登录自动启动。
+安装器创建本机桥接、用户服务和应用菜单入口，并设置登录后自动启动。重启电脑后，登录当前用户即可直接打开网页。
 
 ```bash
 systemctl --user start codex-board.service
 systemctl --user stop codex-board.service
+systemctl --user disable --now codex-board.service # 关闭登录自动启动并停止服务
 journalctl --user -u codex-board.service -n 30
 ```
 

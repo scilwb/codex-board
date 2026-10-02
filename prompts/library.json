@@ -12,6 +12,18 @@
       "createdAt": 1790836416392,
       "updatedAt": 1790836416392,
       "revision": 1
+    },
+    {
+      "id": "843e0eda-fe4b-4a6b-ae23-365066238328",
+      "title": "codex对话框上下文",
+      "content": "model_context_window = 512000\nmodel_auto_compact_token_limit = 460",
+      "tags": [
+        "开发"
+      ],
+      "pinned": false,
+      "createdAt": 1790929703376,
+      "updatedAt": 1790929703376,
+      "revision": 1
     }
   ]
 }

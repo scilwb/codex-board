@@ -27,6 +27,9 @@ Environment="PATH=${escapeUnit(dirname(process.execPath))}:${escapeUnit(join(hom
 ${envLines}
 Restart=on-failure
 RestartSec=3
+
+[Install]
+WantedBy=default.target
 `);
 chmodSync(join(root, 'scripts/launch.sh'), 0o755);
 writeFileSync(join(appsDir, 'codex-board.desktop'), `[Desktop Entry]
@@ -40,5 +43,5 @@ Terminal=false
 Categories=Development;
 `);
 execFileSync('systemctl', ['--user', 'daemon-reload']);
-execFileSync('systemctl', ['--user', 'start', 'codex-board.service']);
+execFileSync('systemctl', ['--user', 'enable', '--now', 'codex-board.service']);
 console.log('Codex Board: http://127.0.0.1:4317');
