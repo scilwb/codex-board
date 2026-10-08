@@ -114,7 +114,7 @@ function activate(context) {
             if (typeof command.id !== 'string' || command.id.length > 200) throw new Error('Invalid bridge command');
             let result = completed.get(command.id);
             if (!result) {
-              result = await reveal(command.threadId);
+              result = await reveal(command.threadId, { allowUnfocused: command.allowUnfocused === true });
               completed.set(command.id, result);
               if (completed.size > 100) completed.delete(completed.keys().next().value);
               output.appendLine(`Open ${command.threadId}: ${result.status}${result.reused ? ' (existing tab)' : ''}${result.message ? ` — ${result.message}` : ''}`);

@@ -37,7 +37,7 @@ test('existing conversation reuses its exact URI and column, then focuses its wi
   const existing = vscode.window.tabGroups.all[1].tabs[0];
   existing.input.uri.query = 'preserved=yes';
   const result = await createNavigator(vscode)(A);
-  assert.deepEqual(result, { status: 'opened', reused: true, windowFocused: true });
+  assert.deepEqual(result, { status: 'opened', reused: true, windowFocused: true, editorOpened: true, activeThreadId: A });
   assert.equal(calls[0].resource, existing.input.uri);
   assert.equal(calls[0].options.viewColumn, 2);
   assert.equal(calls[0].options.preview, false);
@@ -48,7 +48,7 @@ test('existing conversation reuses its exact URI and column, then focuses its wi
 
 test('new conversation opens one custom editor without a CLI/deep link', async () => {
   const { vscode, calls } = fakeVscode();
-  assert.deepEqual(await createNavigator(vscode)(A), { status: 'opened', reused: false, windowFocused: true });
+  assert.deepEqual(await createNavigator(vscode)(A), { status: 'opened', reused: false, windowFocused: true, editorOpened: true, activeThreadId: A });
   assert.deepEqual(calls[0].resource, uri(A));
   assert.equal(calls[0].viewType, 'chatgpt.conversationEditor');
   assert.equal(calls[0].options.viewColumn, -1);
@@ -106,4 +106,27 @@ test('only Codex local conversation custom editor tabs count as open', () => {
   assert.equal(threadIdFromTab({ input: { uri: uri(A) } }), null);
   assert.equal(threadIdFromTab({ input: { viewType: 'other', uri: uri(A) } }), null);
   assert.equal(threadIdFromTab({ input: { viewType: 'chatgpt.conversationEditor', uri: { ...uri(A), authority: 'wrong' } } }), null);
+});
+
+test('inheritance may send to the confirmed exact tab while the OS keeps the browser in front', async () => {
+  const { vscode } = fakeVscode();
+  vscode.window.state.focused = false;
+  vscode.window.onDidChangeWindowState = () => ({ dispose() {} });
+  const result = await createNavigator(vscode, { focusTimeoutMs: 10 })(A, { allowUnfocused: true });
+  assert.equal(result.status, 'opened');
+  assert.equal(result.editorOpened, true);
+  assert.equal(result.activeThreadId, A);
+  assert.equal(result.windowFocused, false);
+  assert.match(result.warning, /未将窗口切到前台/);
+});
+
+test('inheritance never treats an unfocused wrong tab as the requested target', async () => {
+  const { vscode } = fakeVscode({ existing: [B] });
+  vscode.window.tabGroups.all[0].activeTab = vscode.window.tabGroups.all[0].tabs[0];
+  vscode.window.state.focused = false;
+  vscode.window.onDidChangeWindowState = () => ({ dispose() {} });
+  vscode.commands.executeCommand = async () => {};
+  const result = await createNavigator(vscode, { focusTimeoutMs: 10 })(A, { allowUnfocused: true });
+  assert.equal(result.status, 'error');
+  assert.match(result.message, /尚未确认目标/);
 });

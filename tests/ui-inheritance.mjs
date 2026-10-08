@@ -85,6 +85,7 @@ const bridge = {
   },
   async submitInheritance(id, options) {
     const navigation = await this.open(id, options.windowId);
+    if (!options.sourceThreadId && readFileSync(pathFor(id), 'utf8').includes('WAX误入的旧交流')) throw Object.assign(new Error('已有其他交流，需要补交接修复'), { dispatched: false, requiresRepair: true });
     if (sendGate) await sendGate;
     if (sendReceipts.has(options.submissionId)) return { ...navigation, ...sendReceipts.get(options.submissionId), alreadySubmitted: true };
     assert.equal(options.settings.model, sourceSettings.model);
@@ -103,6 +104,7 @@ const bridge = {
     if (failAfterSend) { failAfterSend = false; throw Object.assign(new Error('模拟已发送但回执丢失'), { dispatched: true }); }
     return { ...navigation, ...receipt };
   },
+  async submitRepair(id, options) { return this.submitInheritance(id, options); },
   close() {},
 };
 const server = createServer({ ...fixture, appServer, bridge, pollIntervalMs: 100 });
@@ -300,7 +302,7 @@ try {
     const attempts = starts();
     assert.equal(attempts, 3);
     assert.equal(opened.at(-1).id, secondCreatedId);
-    await expect(page.getByTestId('inheritance-submission-status')).toContainText('发送交接提示词失败');
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('继承未完成');
     await expect(page.getByTestId('inheritance-submission-error')).toContainText('模拟 VS Code 打开失败');
     failAfterSend = true;
     await page.getByTestId('inheritance-start').click();
@@ -344,6 +346,58 @@ try {
     assert.equal(sent.at(-1).windowId, connectedWindows[1].id);
     assert.equal(starts(), creationCount);
     connectedWindows = connectedWindows.slice(0, 1);
+  });
+  await check('失败继承持续可见，已交流的原对话可预览并补交接，保留旧消息且只发送一次', async () => {
+    await selectThread(sourceId);
+    await page.getByTestId('detail-inherit').click();
+    await expect(page.getByTestId('inherit-prompt')).toBeEnabled();
+    const handoff = await page.getByTestId('inherit-prompt').inputValue();
+    const sendCount = sent.length;
+    failNextOpen = true;
+    await page.getByTestId('modal-submit').click();
+    await expect(page.getByTestId('thread-modal')).toHaveCount(0);
+    const childId = await page.getByTestId('detail-thread-id').textContent();
+    await expect(page.getByTestId(`inherit-status-${childId}`)).toHaveText('继承未完成');
+    const oldMessage = 'WAX误入的旧交流';
+    appendFileSync(pathFor(childId), JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: oldMessage } }) + '\n');
+    const creationCount = starts();
+    await page.getByTestId('inheritance-start').click();
+    await expect(page.getByTestId('repair-dialog')).toBeVisible();
+    await expect(page.getByTestId('repair-source')).toContainText(sourceId);
+    await expect(page.getByTestId('repair-prompt')).toContainText('唯一直接来源对话 ID');
+    await expect(page.getByTestId('repair-prompt')).toContainText(handoff);
+    const correction = await page.getByTestId('repair-prompt').textContent();
+    assert.equal(sent.length, sendCount, 'preview must not send a model message');
+    assert.equal(starts(), creationCount, 'repair must keep the original conversation');
+    sendGate = new Promise(resolve => { releaseSend = resolve; });
+    await page.getByTestId('repair-submit').click();
+    await expect(page.getByTestId('repair-submit')).toBeDisabled();
+    await page.getByTestId('repair-dialog').locator('form').evaluate(form => form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+    releaseSend(); sendGate = null;
+    await expect(page.getByTestId('repair-dialog')).toHaveCount(0);
+    await expect(page.getByTestId('detail-thread-id')).toHaveText(childId);
+    await expect(page.getByTestId('inheritance-submission-status')).toContainText('交接提示词已发送');
+    await expect(page.getByTestId(`inherit-status-${childId}`)).toHaveText('继承');
+    assert.equal(sent.length, sendCount + 1);
+    assert.equal(sent.at(-1).id, childId);
+    assert.equal(sent.at(-1).sourceThreadId, sourceId);
+    assert.equal(sent.at(-1).prompt, correction);
+    const saved = server.board.store.inheritance(childId);
+    assert.equal(saved.prompt, handoff);
+    assert.equal(saved.repair.prompt, correction);
+    assert.equal(saved.repair.originalSubmission.status, 'needs_repair');
+    assert.equal(saved.repair.submission.status, 'submitted');
+    assert.equal(saved.submission.status, 'submitted');
+    const history = readFileSync(pathFor(childId), 'utf8');
+    assert.ok(history.includes(oldMessage));
+    assert.equal(history.split(JSON.stringify(correction)).length - 1, 1);
+    await page.reload();
+    await selectThread(childId);
+    await page.getByTestId('detail-open').click();
+    await expect(page.getByTestId('toast')).toContainText('已打开');
+    assert.equal(sent.length, sendCount + 1);
+    assert.equal(starts(), creationCount);
+    assert.equal(readFileSync(pathFor(sourceId), 'utf8'), sourceBefore);
   });
   await check('旧版继承显示补发说明，打开已有对话不会自动再发送', async () => {
     const managed = server.board.store.state.managedThreads[firstCreatedId];

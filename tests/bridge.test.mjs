@@ -62,6 +62,48 @@ test('继承定位失败不会发送提示词，也不会把打开当作发送�
   await assert.rejects(failed, error => error.dispatched === false && /无法打开目标/.test(error.message));
 });
 
+test('继承发送接受精确标签确认，窗口失焦只返回提醒', async t => {
+  const sent = [];
+  const ipcClient = { async submitInheritance(id, body) { sent.push({ id, body }); return { submitted: true, verified: true, turnId: 'visible-turn' }; }, close() {} };
+  const { f, bridge, window } = setup(t, { ipcClient });
+  const sending = bridge.submitInheritance(f.ids[0], { windowId: window.id, prompt: 'UMI交接', submissionId: randomUUID() });
+  const { command } = await bridge.poll(window.id);
+  assert.equal(command.allowUnfocused, true);
+  bridge.result({ clientId: window.id, commandId: command.id, status: 'opened', editorOpened: true,
+    activeThreadId: f.ids[0], windowFocused: false, warning: '目标已确认，窗口未到前台' });
+  const result = await sending;
+  assert.equal(result.submitted, true);
+  assert.equal(result.windowFocused, false);
+  assert.match(result.warning, /窗口未到前台/);
+  assert.equal(sent.length, 1);
+});
+
+test('旧桥接的焦点错误必须等后续新鲜目标注册，不能凭缓存发送', async t => {
+  const sent = [];
+  const ipcClient = { async submitInheritance(id) { sent.push(id); return { submitted: true, verified: true, turnId: 'legacy-confirmed' }; }, close() {} };
+  const { f, bridge, window } = setup(t, { ipcClient });
+  const sending = bridge.submitInheritance(f.ids[0], { prompt: '正确来源', submissionId: randomUUID() });
+  const { command } = await bridge.poll(window.id);
+  bridge.result({ clientId: window.id, commandId: command.id, status: 'error',
+    message: '对话标签已定位，但系统未将 VS Code 窗口切到前台；请点击任务栏中的目标窗口。' });
+  await Promise.resolve(); assert.equal(sent.length, 0);
+  bridge.register({ ...window, activeThreadId: f.ids[1], openThreads: [f.ids[0], f.ids[1]] });
+  await Promise.resolve(); assert.equal(sent.length, 0);
+  bridge.register(window);
+  assert.equal((await sending).submitted, true);
+  assert.deepEqual(sent, [f.ids[0]]);
+});
+
+test('继承窗口回执给出另一个对话时，即使已聚焦也拒绝发送', async t => {
+  const ipcClient = { async submitInheritance() { throw Error('must not dispatch'); }, close() {} };
+  const { f, bridge, window } = setup(t, { ipcClient });
+  const sending = bridge.submitInheritance(f.ids[0], { prompt: '正确来源', submissionId: randomUUID() });
+  const { command } = await bridge.poll(window.id);
+  bridge.result({ clientId: window.id, commandId: command.id, status: 'opened', editorOpened: true,
+    activeThreadId: f.ids[1], windowFocused: true });
+  await assert.rejects(sending, error => error.dispatched === false && /ID 与目标不匹配/.test(error.message));
+});
+
 test('桥接：不可用窗口超时后不给编辑器堆积重试', async t => {
   const { f, bridge, window } = setup(t, { timeoutMs: 30 });
   await assert.rejects(bridge.open(f.ids[0], window.id), error => error.status === 504 && /1 秒/.test(error.message));

@@ -13,11 +13,13 @@ The Board must run on `127.0.0.1:4317`. Authentication uses the local token file
 only conversation IDs; inheritance prompts travel over the user's private
 `~/.codex/ipc/ipc.sock` connection.
 
-"Opened" acknowledges that the matching editor tab is active and VS Code reports
-its window focused. Window activation gets a separate two-second confirmation;
-if the desktop blocks it, the bridge reports an error instead of success. A newly opened
-Codex webview may still need to load its history; the bridge cannot guarantee
-that the separate Codex extension has finished rendering.
+"Opened" includes the active conversation ID, editor confirmation and a separate
+window focus result. Ordinary navigation requires the window to be focused.
+Inheritance and explicit context repair may proceed with a verified matching tab
+even if the desktop blocks foreground activation; the Board shows a focus warning
+and still verifies the native send receipt. A newly opened Codex webview may
+still need to load its history; the bridge cannot guarantee that the separate
+Codex extension has finished rendering.
 
 VS Code exposes editor tabs through `tabGroups`, but Codex's sidebar is a
 separate webview. The bridge cannot identify the sidebar's current conversation.
@@ -34,3 +36,9 @@ Inheritance additionally uses Codex's internal conversation owner IPC protocol.
 The Board refuses to dispatch when the owner or history cannot be verified, and
 retains the new conversation and prompt for recovery. An uncertain send is
 checked against existing user turns before it can be marked as submitted.
+Before dispatch, the Board applies source settings through the same owner,
+reads them back and rejects mismatched model, effort, mode or Full Access.
+The visible turn does not inherit a stale target collaboration mode.
+Explicit repair preserves an occupied conversation's history and sends one
+visible correction containing the saved direct source and handoff. It refuses
+to insert a message during an active turn or after concurrent user history changes.

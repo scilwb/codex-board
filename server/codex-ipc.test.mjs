@@ -11,13 +11,14 @@ const THREAD = '01234567-89ab-cdef-0123-456789abcdef';
 const OWNER = 'owner-client';
 const text = value => [{ type: 'text', text: value, text_elements: [] }];
 
-async function nativeFixture(t, { state = { turns: [] }, dropStartAck = false, ownerAvailable = true, timeoutMs = 1000, unresumedReads = 0 } = {}) {
+async function nativeFixture(t, { state = { turns: [] }, dropStartAck = false, ownerAvailable = true, timeoutMs = 1000, unresumedReads = 0, onHistoryRead, ignoreSettingsUpdate = false, rejectSettingsUpdate = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'codex-board-ipc-'));
   const endpoint = join(dir, 'ipc.sock');
   const sockets = new Set();
   const starts = [];
   const requests = [];
   let revision = 0;
+  let historyReads = 0;
   const server = createServer(socket => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
@@ -55,7 +56,31 @@ async function nativeFixture(t, { state = { turns: [] }, dropStartAck = false, o
           else response.result = { supportsUntrustedAppInput: true };
         } else if (message.method === 'thread-follower-load-complete-history') {
           if (unresumedReads-- > 0) { response.resultType = 'error'; response.error = 'Conversation must be resumed before loading history'; }
-          else { snapshot(); response.result = { revision }; }
+          else { onHistoryRead?.(state, ++historyReads); snapshot(); response.result = { revision }; }
+        } else if (message.method === 'thread-follower-update-thread-settings') {
+          if (rejectSettingsUpdate) { response.resultType = 'error'; response.error = 'unsupported-settings'; }
+          else {
+            const settings = message.params.threadSettings;
+            if (!ignoreSettingsUpdate) {
+              state.latestThreadSettings = { ...state.latestThreadSettings, ...settings };
+              // Current Codex snapshots expose the permission profile ID,
+              // while the request accepts the permissions string.
+              delete state.latestThreadSettings.permissions;
+              state.latestThreadSettings.activePermissionProfile = { id: settings.permissions };
+              if (settings.model) state.latestModel = settings.model;
+              if (settings.effort !== undefined) state.latestReasoningEffort = settings.effort;
+              if (settings.collaborationMode) state.latestCollaborationMode = settings.collaborationMode;
+              else if (state.latestCollaborationMode) {
+                state.latestCollaborationMode = { ...state.latestCollaborationMode, settings: {
+                  ...state.latestCollaborationMode.settings,
+                  model: settings.model ?? state.latestCollaborationMode.settings.model,
+                  reasoning_effort: settings.effort !== undefined ? settings.effort : state.latestCollaborationMode.settings.reasoning_effort,
+                } };
+              }
+              if (state.latestCollaborationMode) state.latestThreadSettings.collaborationMode = state.latestCollaborationMode;
+            }
+            response.result = { applied: true };
+          }
         } else if (message.method === 'thread-follower-start-turn') {
           starts.push(message.params.turnStart);
           const request = message.params.turnStart.request;
@@ -82,7 +107,7 @@ test('inheritance sends a visible native turn through its VS Code owner with sou
   assert.equal(starts.length, 1);
   assert.deepEqual(starts[0], {
     request: { threadId: THREAD, clientUserMessageId: submissionId, input: text('请读取关键路径并继续任务。'), cwd: '/workspace', approvalPolicy: 'never', permissions: ':danger-full-access', model: 'gpt-6.1-sol', effort: 'ultra', serviceTier: 'priority', summary: 'detailed', collaborationMode: { mode: 'plan', settings: { model: 'gpt-6.1-sol', reasoning_effort: 'ultra', developer_instructions: null } } },
-    context: { inheritThreadSettings: true, useAppServerPermissionDefault: false },
+    context: { inheritThreadSettings: false, useAppServerPermissionDefault: false },
   });
   const start = requests.find(item => item.method === 'thread-follower-start-turn');
   assert.equal(start.version, 2);
@@ -152,7 +177,7 @@ test('ownership before native resume completes retries history safely before sub
   assert.equal(result.submitted, true);
   assert.equal(starts.length, 1);
   const methods = requests.map(item => item.method);
-  assert.equal(methods.filter(method => method === 'thread-follower-load-complete-history').length, 3);
+  assert.equal(methods.filter(method => method === 'thread-follower-load-complete-history').length, 4);
   assert.equal(methods.at(-1), 'thread-follower-start-turn');
 });
 
@@ -188,4 +213,68 @@ test('canonical history projection contains only real public user turns', () => 
   } } }, developerInstructions: 'private instructions' });
   assert.deepEqual(publicState, { revision: 0, pending: false, turns: [{ turnId: 'native-1', status: 'completed', submissionId: 'submission-1', text: '用户输入' }] });
   assert.equal(JSON.stringify(publicState).includes('private'), false);
+});
+
+test('explicit repair can add a visible correction to an idle occupied thread with source settings', async t => {
+  const { client, starts, state } = await nativeFixture(t, { state: { turns: [{ turnId: 'wax-turn', params: { input: text('WAX提问') }, status: 'completed' }] } });
+  await assert.rejects(client.submitInheritance(THREAD, { prompt: 'UMI交接', submissionId: randomUUID() }), error => error.requiresRepair === true && error.dispatched === false);
+  assert.equal(starts.length, 0);
+  const sourceThreadId = '11111111-1111-4111-8111-111111111111';
+  const result = await client.submitRepair(THREAD, { sourceThreadId, prompt: 'UMI更正交接', submissionId: randomUUID(), settings: { model: 'gpt-6-astra', reasoningEffort: 'max' } });
+  assert.equal(result.submitted, true);
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].request.threadId, THREAD);
+  assert.equal(starts[0].request.model, 'gpt-6-astra');
+  assert.equal(starts[0].request.effort, 'max');
+  assert.deepEqual(starts[0].request.input, text('UMI更正交接'));
+  assert.equal(starts[0].request.permissions, ':danger-full-access');
+});
+
+test('source without a mode replaces a target collaboration model before the first visible turn', async t => {
+  const state = { turns: [], latestModel: 'gpt-6.1-sol', latestReasoningEffort: 'medium',
+    latestCollaborationMode: { mode: 'default', settings: { model: 'gpt-6.1-sol', reasoning_effort: 'medium', developer_instructions: 'private-mode-data' } },
+  };
+  const { client, starts, requests } = await nativeFixture(t, { state });
+  await client.submitInheritance(THREAD, { prompt: 'UMI继承确认', submissionId: randomUUID(), settings: { model: 'gpt-6-astra', reasoningEffort: 'max' } });
+  const update = requests.find(item => item.method === 'thread-follower-update-thread-settings');
+  assert.equal(update.version, 2);
+  assert.equal(update.targetClientId, OWNER);
+  assert.equal(state.latestCollaborationMode.settings.model, 'gpt-6-astra');
+  assert.equal(state.latestCollaborationMode.settings.reasoning_effort, 'max');
+  assert.equal(starts[0].context.inheritThreadSettings, false);
+  const effectiveMode = starts[0].request.collaborationMode ?? (starts[0].context.inheritThreadSettings ? state.latestCollaborationMode : null);
+  assert.equal(effectiveMode?.settings.model ?? starts[0].request.model, 'gpt-6-astra');
+  const projected = publicSubmissionState(state);
+  assert.equal(projected.settings.model, 'gpt-6-astra');
+  assert.equal(projected.settings.approvalPolicy, 'never');
+  assert.equal(JSON.stringify(projected).includes('private-mode-data'), false);
+});
+
+test('acknowledged but unapplied source settings and unsupported metadata fail before a visible turn', async t => {
+  for (const behavior of [{ ignoreSettingsUpdate: true }, { rejectSettingsUpdate: true }]) {
+    const { client, starts } = await nativeFixture(t, { ...behavior, state: { turns: [], latestModel: 'gpt-6.1-sol', latestReasoningEffort: 'medium' } });
+    await assert.rejects(client.submitInheritance(THREAD, { prompt: '不能假报继承成功', submissionId: randomUUID(), settings: { model: 'gpt-6-astra', reasoningEffort: 'max' } }), error => error.dispatched === false);
+    assert.equal(starts.length, 0);
+  }
+});
+
+test('repair waits for an active conversation and rejects history changed between its two checks', async t => {
+  const sourceThreadId = '11111111-1111-4111-8111-111111111111';
+  const busy = await nativeFixture(t, { state: { turns: [], threadRuntimeStatus: { type: 'active' } } });
+  await assert.rejects(busy.client.submitRepair(THREAD, { sourceThreadId, prompt: '修复', submissionId: randomUUID() }), error => error.dispatched === false);
+  assert.equal(busy.starts.length, 0);
+  const changed = await nativeFixture(t, { state: { turns: [{ turnId: 'old', params: { input: text('旧消息') }, status: 'completed' }] }, onHistoryRead(state, count) {
+    if (count === 2) state.turns.push({ turnId: 'new', params: { input: text('刚刚的新输入') }, status: 'completed' });
+  } });
+  await assert.rejects(changed.client.submitRepair(THREAD, { sourceThreadId, prompt: '修复', submissionId: randomUUID() }), /内容发生变化/);
+  assert.equal(changed.starts.length, 0);
+});
+
+test('repair with a lost acknowledgement only reconciles the same visible correction', async t => {
+  const { client, starts } = await nativeFixture(t, { dropStartAck: true, timeoutMs: 40, state: { turns: [{ turnId: 'old', params: { input: text('旧输入') }, status: 'completed' }] } });
+  const params = { sourceThreadId: '11111111-1111-4111-8111-111111111111', prompt: '来源更正', submissionId: randomUUID() };
+  await assert.rejects(client.submitRepair(THREAD, params), error => error.dispatched === true);
+  const result = await client.submitRepair(THREAD, { ...params, allowDispatch: false });
+  assert.equal(result.reconciled, true);
+  assert.equal(starts.length, 1);
 });

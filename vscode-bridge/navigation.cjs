@@ -45,7 +45,7 @@ async function focusMainWindow(vscode, timeoutMs) {
 
 function createNavigator(vscode, { timeoutMs = 15000, focusTimeoutMs = 2000 } = {}) {
   let pending = null;
-  return async function reveal(threadId) {
+  return async function reveal(threadId, { allowUnfocused = false } = {}) {
     if (!UUID.test(threadId || '')) return { status: 'error', reused: false, message: '对话 ID 无效。' };
     if (pending) return { status: 'error', reused: false, message: 'VS Code 中的上一次打开仍未结束，请等待编辑器恢复后再试。' };
     let existing;
@@ -64,10 +64,14 @@ function createNavigator(vscode, { timeoutMs = 15000, focusTimeoutMs = 2000 } = 
         preserveFocus: false,
         preview: false,
       });
-      await focusMainWindow(vscode, focusTimeoutMs);
+      let focusError;
+      try { await focusMainWindow(vscode, focusTimeoutMs); }
+      catch (error) { if (!allowUnfocused) throw error; focusError = error; }
       const activeId = threadIdFromTab(vscode.window.tabGroups.activeTabGroup?.activeTab);
       if (activeId !== threadId) throw new Error('已请求打开，但 VS Code 尚未确认目标对话标签页处于活动状态。');
-      return { status: 'opened', reused, windowFocused: true };
+      return { status: 'opened', reused, windowFocused: vscode.window.state.focused === true,
+        editorOpened: true, activeThreadId: activeId,
+        ...(focusError ? { warning: '交接目标标签已确认；系统未将窗口切到前台，可点击任务栏查看。' } : {}) };
     })();
     pending = operation;
     // A timeout does not cancel VS Code's command. Keep the latch held until

@@ -11,6 +11,7 @@ import { GitBranches } from './git.mjs';
 import { HANDOFF_PROMPT_LIMIT } from './handoff.mjs';
 import { DesktopNotifications } from './desktop-notifications.mjs';
 import { PromptLibrary } from './prompt-library.mjs';
+import { buildRepairPrompt, REPAIR_PROMPT_LIMIT } from './inheritance-repair.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const MAX_BODY = 1024 * 1024;
@@ -99,6 +100,7 @@ export function createServer(options = {}) {
   const branches = options.branches || new GitBranches();
   const creationRequests = new Map();
   const inheritanceSubmissions = new Map();
+  const repairSubmissions = new Map();
   const clients = new Set();
   let lastSnapshot = '';
   let operationInFlight = false;
@@ -112,6 +114,10 @@ export function createServer(options = {}) {
     if (thread.inheritance?.submission?.status === 'dispatching') {
       store.updateInheritanceSubmission(id, { ...thread.inheritance.submission, status: 'unknown', updatedAt: Date.now(),
         error: '服务在发送过程中重启，请重试确认接续状态。' });
+    }
+    if (thread.inheritance?.repair?.submission?.status === 'dispatching') {
+      store.updateInheritanceRepair(id, { prompt: thread.inheritance.repair.prompt,
+        submission: { ...thread.inheritance.repair.submission, status: 'unknown', updatedAt: Date.now(), error: '服务在补交接时重启，请核对结果，避免重复发送。' } });
     }
   }
 
@@ -261,6 +267,7 @@ export function createServer(options = {}) {
     if (options.disableOpen) throw fail('本环境未启用 VS Code 跳转，无法发送交接提示词', 503);
     if (body.windowId != null && (typeof body.windowId !== 'string' || !UUID.test(body.windowId))) throw fail('VS Code 窗口标识无效');
     const thread = findThread(id);
+    if (repairSubmissions.has(id)) throw fail('补交接正在处理，请等待确认。', 409);
     const handoff = store.inheritance(thread.id);
     if (!handoff || typeof handoff.prompt !== 'string' || !handoff.prompt.trim()) throw fail('这条对话没有保存的交接提示词', 404);
     const record = store.database().prepare('SELECT rollout_path FROM threads WHERE id=?').get(thread.id);
@@ -292,7 +299,7 @@ export function createServer(options = {}) {
         const result = await bridge.submitInheritance(thread.id, { windowId: body.windowId, prompt: handoff.prompt,
           settings: { ...handoff.settings, cwd: thread.cwd }, submissionId,
           allowDispatch: !previouslyUncertain, historyEmptyVerified });
-        if (result?.submitted !== true || result?.verified !== true) throw Object.assign(fail('VS Code 尚未确认交接提示词已作为消息发送，请重试确认状态。', 502), {
+        if (result?.submitted !== true || result?.verified !== true || typeof result.turnId !== 'string' || !result.turnId) throw Object.assign(fail('VS Code 尚未确认交接提示词已作为消息发送，请重试确认状态。', 502), {
           dispatched: result?.dispatched === false ? false : true,
         });
         const submission = store.updateInheritanceSubmission(thread.id, { ...dispatching, status: 'submitted', updatedAt: Date.now(),
@@ -305,7 +312,7 @@ export function createServer(options = {}) {
         const message = typeof error.message === 'string' && !error.message.includes(handoff.prompt)
           ? error.message.slice(0, 1000) : '发送接续尚未确认，请重试确认状态。';
         error.message = message;
-        const submission = { ...dispatching, status: !previouslyUncertain && error.dispatched === false ? 'failed' : 'unknown', updatedAt: Date.now(), error: message };
+        const submission = { ...dispatching, status: error.requiresRepair ? 'needs_repair' : !previouslyUncertain && error.dispatched === false ? 'failed' : 'unknown', updatedAt: Date.now(), error: message };
         try { store.updateInheritanceSubmission(thread.id, submission); } catch { /* Persisted dispatching remains safe to reconcile. */ }
         broadcast(true);
         error.submission = store.inheritance(thread.id)?.submission || submission;
@@ -316,6 +323,63 @@ export function createServer(options = {}) {
     inheritanceSubmissions.set(thread.id, operation);
     try { return await operation; }
     finally { inheritanceSubmissions.delete(thread.id); }
+  }
+
+  function repairPreview(id) {
+    const thread = findThread(id);
+    const handoff = store.inheritance(id);
+    if (!handoff) throw fail('这条对话没有保存的来源交接资料', 404);
+    return { source: handoff.source, settings: handoff.settings,
+      prompt: handoff.repair?.prompt || buildRepairPrompt(handoff),
+      submission: handoff.repair?.submission || null, maxPromptLength: REPAIR_PROMPT_LIMIT };
+  }
+
+  async function repairInheritance(id, body) {
+    if (options.disableActions || options.disableOpen) throw fail('本环境未启用补交接发送', 503);
+    const thread = findThread(id);
+    const handoff = store.inheritance(id);
+    if (!handoff) throw fail('这条对话没有保存的来源交接资料', 404);
+    if (body.confirmExistingMessages !== true || body.expectedSourceId !== handoff.source?.id) throw fail('请核对来源并明确确认补交接，已有记录将保留。');
+    if (body.windowId != null && (typeof body.windowId !== 'string' || !UUID.test(body.windowId))) throw fail('VS Code 窗口标识无效');
+    if (handoff.repair?.submission.status === 'submitted') return { submitted: true, verified: true, alreadySubmitted: true,
+      turnId: handoff.repair.submission.turnId, submission: handoff.submission, repair: handoff.repair.submission };
+    if (handoff.submission?.status === 'submitted' && !handoff.repair) throw fail('原交接已发送，无需重复补交接。', 409);
+    if (!handoff.repair && !['failed', 'needs_repair'].includes(handoff.submission?.status)) throw fail('请先完成或核对原交接的发送结果，再进行补交接。', 409);
+    if (inheritanceSubmissions.has(id)) throw fail('原交接发送仍在处理，请等待确认。', 409);
+    const existing = repairSubmissions.get(id);
+    if (existing) return existing;
+    if (typeof bridge.submitRepair !== 'function') throw fail('当前桥接尚不支持补交接，请更新后重试。', 503);
+    const preview = repairPreview(id);
+    const previous = handoff.repair?.submission;
+    const submissionId = previous?.submissionId || randomUUID();
+    const uncertain = ['dispatching', 'unknown'].includes(previous?.status);
+    const operation = (async () => {
+      const dispatching = { status: 'dispatching', submissionId, updatedAt: Date.now() };
+      store.updateInheritanceRepair(id, { prompt: preview.prompt, submission: dispatching });
+      broadcast(true);
+      try {
+        const result = await bridge.submitRepair(id, { windowId: body.windowId, prompt: preview.prompt,
+          sourceThreadId: handoff.source.id, settings: { ...handoff.settings, cwd: thread.cwd },
+          submissionId, allowDispatch: !uncertain });
+        if (result?.submitted !== true || result?.verified !== true || typeof result.turnId !== 'string' || !result.turnId) throw Object.assign(fail('补交接发送尚未确认，请核对原对话后重试。', 502), { dispatched: result?.dispatched !== false });
+        const repair = store.updateInheritanceRepair(id, { prompt: preview.prompt, submission: { ...dispatching,
+          status: 'submitted', updatedAt: Date.now(), ...(result.turnId ? { turnId: result.turnId } : {}) } });
+        broadcast(true);
+        return { ...result, submitted: true, verified: true, submission: store.inheritance(id).submission, repair: repair.submission };
+      } catch (error) {
+        const message = typeof error.message === 'string' && !error.message.includes(preview.prompt) ? error.message.slice(0, 1000) : '补交接尚未确认，请核对发送状态。';
+        const repair = { ...dispatching, status: !uncertain && error.dispatched === false ? 'failed' : 'unknown', updatedAt: Date.now(), error: message };
+        try { store.updateInheritanceRepair(id, { prompt: preview.prompt, submission: repair }); } catch { /* Keep uncertain persisted receipt. */ }
+        error.message = message;
+        error.submission = store.inheritance(id).submission;
+        error.repair = repair;
+        error.threadId = id;
+        broadcast(true);
+        throw error;
+      }
+    })();
+    repairSubmissions.set(id, operation);
+    try { return await operation; } finally { repairSubmissions.delete(id); }
   }
 
   const server = http.createServer(async (request, response) => {
@@ -434,6 +498,9 @@ export function createServer(options = {}) {
       }
       const inheritanceStartMatch = pathname.match(/^\/api\/threads\/([^/]+)\/inheritance\/start$/);
       if (request.method === 'POST' && inheritanceStartMatch) return json(response, 200, await startInheritance(inheritanceStartMatch[1], await readJson(request)));
+      const repairMatch = pathname.match(/^\/api\/threads\/([^/]+)\/inheritance\/repair$/);
+      if (request.method === 'GET' && repairMatch) return json(response, 200, repairPreview(repairMatch[1]));
+      if (request.method === 'POST' && repairMatch) return json(response, 200, await repairInheritance(repairMatch[1], await readJson(request)));
       const inheritMatch = pathname.match(/^\/api\/threads\/([^/]+)\/inherit$/);
       if (request.method === 'POST' && inheritMatch) return json(response, 201, { thread: await createRequest(await readJson(request), inheritMatch[1], 'inherit') });
       const forkMatch = pathname.match(/^\/api\/threads\/([^/]+)\/fork$/);
@@ -463,7 +530,8 @@ export function createServer(options = {}) {
       else createReadStream(path).on('error', () => response.destroy()).pipe(response);
     } catch (error) {
       if (!response.headersSent) json(response, error.status || 400, { error: error.message || '操作失败',
-        ...(error.submission ? { submission: error.submission, threadId: error.threadId } : {}) });
+        ...(error.submission ? { submission: error.submission, threadId: error.threadId } : {}),
+        ...(error.repair ? { repair: error.repair } : {}) });
       else response.destroy();
     }
   });

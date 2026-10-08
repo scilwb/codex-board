@@ -44,6 +44,7 @@ async function api(path, options = {}) {
     const error = new Error(body.error || body.message || `请求失败（${response.status}）`);
     error.status = response.status;
     error.submission = body.submission;
+    error.repair = body.repair;
     error.threadId = body.threadId;
     throw error;
   }
@@ -65,6 +66,7 @@ function shortPath(value) { return (value || '').replace(/^\/home\/[^/]+\//, '~/
 function projectName(value) { return value.split('/').filter(Boolean).at(-1) || value; }
 function titleOf(thread) { return thread?.title?.trim() || '未命名对话'; }
 function parentOf(thread) { return thread?.inheritedFromId || thread?.forkedFromId; }
+function inheritanceIncomplete(thread) { return Boolean(thread?.inheritedFromId && ['pending', 'dispatching', 'failed', 'unknown', 'needs_repair'].includes(thread.inheritanceSubmission?.status)); }
 function edgeSignature(edges) {
   return JSON.stringify(edges.map(({ id, source, target, type }) => ({ id, source, target, type })).sort((a, b) => a.id.localeCompare(b.id)));
 }
@@ -88,11 +90,11 @@ const SessionCard = React.memo(function SessionCard({ id, data, selected }) {
       <div className="card-meta">
         <div className={`card-taxonomy ${project ? '' : 'unassigned'}`} title={project ? `${project.name}${task ? ` / ${task.name}` : ''}` : '未归类'}><span>{project?.name || '未归类'}</span>{task && <><span className="taxonomy-separator">/</span><span>{task.name}</span></>}</div>
         <span className="card-branch" title={`Git 分支：${thread.branch || '未知'}`}><GitBranch size={10} /><span>{thread.branch || '分支未知'}</span></span>
-        {thread.inheritedFromId && <span className="inherit-badge" title="由交接提示词继承的新对话"><ArrowRightToLine size={11} />继承</span>}
+        {thread.inheritedFromId && <span className={`inherit-badge ${inheritanceIncomplete(thread) ? 'incomplete' : ''}`} data-testid={`inherit-status-${id}`} title={inheritanceIncomplete(thread) ? '来源已记录，交接提示词尚未确认发送。' : '由交接提示词继承的新对话'}><ArrowRightToLine size={11} />{inheritanceIncomplete(thread) ? '继承未完成' : '继承'}</span>}
         {thread.forkedFromId && <span className="fork-badge"><GitFork size={11} /> Fork</span>}
       </div>
       <div className="card-actions nodrag nopan">
-        <button className="card-open" disabled={!canOpen} data-testid={`open-${id}`} onClick={(event) => { event.stopPropagation(); onOpen(thread); }}>{opening ? <LoaderCircle size={14} className="spin" /> : <ArrowUpRight size={14} />}{opening ? '正在定位…' : 'VS Code'}</button>
+        <button className="card-open" disabled={!canOpen} data-testid={`open-${id}`} onClick={(event) => { event.stopPropagation(); onOpen(thread); }}>{opening ? <LoaderCircle size={14} className="spin" /> : <ArrowUpRight size={14} />}{opening ? '正在定位…' : inheritanceIncomplete(thread) ? '完成继承' : 'VS Code'}</button>
         <button className="card-inherit" title="用交接提示词继承为新对话" disabled={!canInherit} data-testid={`inherit-${id}`} onClick={(event) => { event.stopPropagation(); onInherit(thread); }}><ArrowRightToLine size={13} /><span>继承</span></button>
         <button className="card-copy" title="复制对话 ID" aria-label="复制对话 ID" data-testid={`copy-${id}`} onClick={(event) => { event.stopPropagation(); onCopy(thread.id); }}><Copy size={13} /><span>ID</span></button>
         <button className="icon-button fork-button" title="从此对话 Fork" aria-label="从此对话 Fork" disabled={!canFork} data-testid={`fork-${id}`} onClick={(event) => { event.stopPropagation(); onFork(thread); }}><GitFork size={14} /></button>
@@ -375,19 +377,22 @@ function App() {
         try { localStorage.setItem('codex-board.window-targets', JSON.stringify(windowTargets.current)); } catch { /* Browser storage may be disabled. */ }
       }
       setWindowPicker(null);
-      notify(startInheritance ? '交接提示词已发送，可在 VS Code 查看思考和回复。' : result.reused ? '已定位到已打开的对话' : '已打开 VS Code 对话标签');
+      notify(startInheritance ? `交接提示词已发送，可在 VS Code 查看思考和回复。${result.warning ? '窗口未到前台，可点击任务栏查看。' : ''}` : result.reused ? '已定位到已打开的对话' : '已打开 VS Code 对话标签');
     } catch (err) {
       const uncertain = err.name === 'AbortError' || err instanceof TypeError;
       if (err.name === 'AbortError') err = new Error(startInheritance ? '发送结果尚未确认，请在对话详情中重试核对。' : '定位超时，请检查 VS Code 是否响应后再试。');
       if (startInheritance) {
         setSnapshot((current) => ({ ...current, threads: current.threads.map((item) => item.id === thread.id ? { ...item, inheritanceSubmission: err.submission || { ...item.inheritanceSubmission, status: uncertain ? 'unknown' : 'failed', error: err.message } } : item) }));
         refreshSnapshot().catch(() => {});
+        if (err.submission?.status === 'needs_repair') setModal({ kind: 'repair', thread });
       }
       notify(`${startInheritance ? '交接提示词未确认发送' : '打开失败'}：${err.message}`, 'error'); err.reported = true; throw err;
     } finally { clearTimeout(timeout); opening.current = false; setOpeningThreadId(null); }
   }, [notify, refreshSnapshot]);
   const openThread = useCallback(async (thread, chooseWindow = false, startInheritance = false) => {
     if (opening.current) return;
+    if (thread.inheritanceSubmission?.status === 'needs_repair') { setModal({ kind: 'repair', thread }); return; }
+    startInheritance ||= inheritanceIncomplete(thread);
     opening.current = true;
     setOpeningThreadId(thread.id);
     const controller = new AbortController();
@@ -477,7 +482,7 @@ function App() {
       interactionWidth: 20,
     }));
     const inherited = visibleThreads.filter((thread) => thread.inheritedFromId && ids.has(thread.inheritedFromId)).map((thread) => ({
-      id: `inherit:${thread.id}`, source: thread.inheritedFromId, target: thread.id, type: 'routed', label: '继承', data: { cards },
+      id: `inherit:${thread.id}`, source: thread.inheritedFromId, target: thread.id, type: 'routed', label: inheritanceIncomplete(thread) ? '继承未完成' : '继承', data: { cards },
       deletable: false, selected: selectedEdgeId === `inherit:${thread.id}`,
       markerEnd: { type: MarkerType.ArrowClosed, color: '#609293', width: 14, height: 14 },
       style: { stroke: '#609293', strokeWidth: selectedEdgeId === `inherit:${thread.id}` ? 2 : 1.5, strokeDasharray: '7 3' },
@@ -623,7 +628,7 @@ function App() {
             <div className="detail-activity" data-status={activityPresentation(selectedThread).status}><ActivityBadge thread={selectedThread} /><p>{activityPresentation(selectedThread).reason}</p>{selectedThread.activity?.at && <small>状态记录于 {new Date(selectedThread.activity.at).toLocaleString('zh-CN')}</small>}</div>
             <p className="detail-preview">{selectedThread.preview || '暂无内容预览'}</p>
             <RecentReplies key={selectedThread.id} thread={selectedThread} />
-            {selectedThread.inheritedFromId && <InheritedPrompt key={`inherited:${selectedThread.id}`} thread={selectedThread} notify={notify} onStart={() => openThread(selectedThread, false, true)} starting={!!openingThreadId} />}
+            {selectedThread.inheritedFromId && <InheritedPrompt key={`inherited:${selectedThread.id}`} thread={selectedThread} notify={notify} onStart={() => openThread(selectedThread, false, true)} onRepair={() => setModal({ kind: 'repair', thread: selectedThread })} starting={!!openingThreadId} />}
             <div className="assignment-fields"><div className="assignment-label"><label htmlFor="assign-project">项目</label><button className="icon-button" aria-label="编辑项目和任务" title="编辑项目和任务" onClick={() => setOrganizationModal({ projectId: selectedAssignment.projectId })}><Pencil size={12} /></button></div><select id="assign-project" className="form-input" data-testid="assign-project" value={selectedAssignment.projectId || ''} disabled={organizationSaving} onChange={(event) => assignThread(event.target.value)}><option value="">未归类</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><div className="assignment-label"><label htmlFor="assign-task">任务</label>{selectedAssignment.projectId && <button className="icon-button" aria-label="添加项目任务" title="添加项目任务" onClick={() => setOrganizationModal({ projectId: selectedAssignment.projectId, action: 'createTask' })}><Plus size={12} /></button>}</div><select id="assign-task" className="form-input" data-testid="assign-task" value={selectedAssignment.taskId || ''} disabled={organizationSaving || !selectedAssignment.projectId} onChange={(event) => assignThread(selectedAssignment.projectId, event.target.value)}><option value="">未指定任务</option>{organization.tasks.filter((task) => task.projectId === selectedAssignment.projectId).map((task) => <option key={task.id} value={task.id}>{task.name}</option>)}</select></div>
             <dl><dt>对话 ID <button className="icon-button" aria-label="复制详情中的对话 ID" data-testid="detail-copy" onClick={() => copyId(selectedThread.id)}><Copy size={12} /></button></dt><dd className="thread-id" data-testid="detail-thread-id">{selectedThread.id}</dd><dt>文件夹</dt><dd>{shortPath(selectedThread.cwd) || '未知'}</dd><dt>Git 分支</dt><dd>{selectedThread.branch || '分支未知'}</dd><dt>最近活动</dt><dd>{selectedThread.updatedAt ? new Date(Number(selectedThread.updatedAt)).toLocaleString('zh-CN') : '未知'}</dd>{selectedThread.inheritedFromId && <><dt>继承来源</dt><dd className="thread-id" data-testid="detail-inherited-from">{selectedThread.inheritedFromId}</dd></>}{selectedThread.forkedFromId && <><dt>Fork 来源</dt><dd className="thread-id">{selectedThread.forkedFromId}</dd></>}</dl>
             <button className="primary-button full-width" onClick={() => openThread(selectedThread)} disabled={snapshot.capabilities.openVscode === false || !!openingThreadId} data-testid="detail-open">{openingThreadId === selectedThread.id ? <LoaderCircle size={15} className="spin" /> : <ArrowUpRight size={15} />}{openingThreadId === selectedThread.id ? '正在定位…' : '在 VS Code 打开'}</button><button className="change-window" onClick={() => openThread(selectedThread, true)} disabled={snapshot.capabilities.openVscode === false || !!openingThreadId} data-testid="change-window">选择其他 VS Code 窗口</button><button className="secondary-button full-width inherit-detail-button" onClick={() => inheritThread(selectedThread)} disabled={snapshot.capabilities.inherit === false || snapshot.capabilities.create === false || !!openingThreadId} data-testid="detail-inherit"><ArrowRightToLine size={14} />继承为新对话</button><button className="secondary-button full-width" onClick={() => forkThread(selectedThread)} disabled={snapshot.capabilities.fork === false} data-testid="detail-fork"><GitFork size={14} /> 从此对话 Fork</button>
@@ -632,7 +637,7 @@ function App() {
           {(selectedManualEdge || selectedFork || selectedInherited) && <aside className="detail-panel relation-panel" data-testid="edge-detail"><div className="detail-heading"><span>{selectedInherited ? '继承关系' : selectedFork ? 'Fork 关系' : '编辑关系'}</span><button className="icon-button" aria-label="关闭关系详情" onClick={() => setSelectedEdgeId(null)}><X size={16} /></button></div><div className="edge-endpoints"><span>{titleOf(threads.find((thread) => thread.id === (selectedManualEdge?.source || selectedInherited?.inheritedFromId || selectedFork?.forkedFromId)))}</span><span className="edge-direction">↓</span><span>{titleOf(threads.find((thread) => thread.id === (selectedManualEdge?.target || selectedInherited?.id || selectedFork?.id)))}</span></div>{selectedManualEdge ? <><label className="field-label" htmlFor="edge-kind">关系类型</label><select id="edge-kind" className="form-input" value={selectedManualEdge.type} data-testid="edge-type" onChange={(event) => saveEdges(graph.current.edges.map((edge) => edge.id === selectedManualEdge.id ? { ...edge, type: event.target.value } : edge))}>{Object.entries(RELATIONS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><p className="field-note">用于标记对话关系，不会自动传递上下文或执行任务。</p><button className="danger-button full-width" data-testid="delete-edge" onClick={() => { saveEdges(graph.current.edges.filter((edge) => edge.id !== selectedManualEdge.id)); setSelectedEdgeId(null); }}><Trash2 size={13} /> 删除连线</button></> : selectedInherited ? <><p className="field-note">这条新对话由来源对话的交接提示词创建，继承关系自动保留。</p><dl><dt>来源对话 ID</dt><dd className="thread-id" data-testid="inherit-source-id">{selectedInherited.inheritedFromId}</dd></dl><button className="secondary-button full-width" data-testid="inherit-view-source" onClick={() => { const source = threads.find((thread) => thread.id === selectedInherited.inheritedFromId); if (source) focusThread(source); }}><ArrowUpRight size={13} />查看来源对话</button></> : <p className="field-note">这条关系来自 Codex 的真实 Fork 记录，自动同步。</p>}</aside>}
         </div>
       </main>
-      {modal && <ThreadModal key={`${modal.kind}:${modal.thread?.id || 'new'}`} modal={modal} folders={workspaceOptions.length ? workspaceOptions : folders} organization={organization} onClose={() => setModal(null)} onCreated={onCreated} />}
+      {modal?.kind === 'repair' ? <InheritanceRepairModal key={modal.thread.id} thread={modal.thread} notify={notify} onClose={() => setModal(null)} onRepaired={async () => { setModal(null); await refreshSnapshot(); }} /> : modal && <ThreadModal key={`${modal.kind}:${modal.thread?.id || 'new'}`} modal={modal} folders={workspaceOptions.length ? workspaceOptions : folders} organization={organization} onClose={() => setModal(null)} onCreated={onCreated} />}
       {organizationModal && <OrganizationModal initial={organizationModal} organization={organization} onClose={() => setOrganizationModal(null)} onSave={updateOrganization} />}
       {windowPicker && <WindowPicker picker={windowPicker} onClose={() => setWindowPicker(null)} onOpen={(thread, windowId, windowTitle) => launchThread(thread, windowId, windowTitle, windowPicker.startInheritance)} />}
       {promptLibraryOpen && <PromptLibraryBoundary onClose={() => setPromptLibraryOpen(false)}><Suspense fallback={<div className="modal-overlay"><section className="modal" role="status"><p className="handoff-loading"><LoaderCircle size={16} className="spin" />正在打开提示词库…</p></section></div>}><PromptLibrary api={api} notify={notify} onClose={() => setPromptLibraryOpen(false)} /></Suspense></PromptLibraryBoundary>}
@@ -662,7 +667,66 @@ function InheritedSettings({ settings, title = '沿用来源配置', testId = 'i
   </section>;
 }
 
-function InheritedPrompt({ thread, notify, onStart, starting }) {
+function InheritanceRepairModal({ thread, notify, onClose, onRepaired }) {
+  const [data, setData] = useState(null);
+  const [windows, setWindows] = useState([]);
+  const [windowId, setWindowId] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const request = useRef(null);
+  const sending = useRef(false);
+  const load = async () => {
+    request.current?.abort();
+    const controller = new AbortController(); request.current = controller;
+    setLoading(true); setError('');
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const [context, connections] = await Promise.all([
+        api(`/api/threads/${encodeURIComponent(thread.id)}/inheritance/repair`, { signal: controller.signal }),
+        api('/api/vscode/windows', { signal: controller.signal }),
+      ]);
+      if (request.current !== controller || controller.signal.aborted) return;
+      setData(context); setWindows(connections.windows || []);
+      const matching = (connections.windows || []).filter(window => window.openThreads?.includes(thread.id));
+      const selected = matching.length === 1 ? matching[0] : connections.windows?.length === 1 ? connections.windows[0] : null;
+      setWindowId(selected?.id || '');
+      if (!connections.windows?.length) setError('VS Code 连接未就绪，请连接后重新读取。');
+    } catch (problem) { if (request.current === controller) setError(problem.name === 'AbortError' ? '读取超时，请重试。' : problem.message); }
+    finally { clearTimeout(timer); if (request.current === controller) setLoading(false); }
+  };
+  useEffect(() => { load(); return () => { request.current?.abort(); request.current = null; }; }, []);
+  const send = async event => {
+    event.preventDefault();
+    if (sending.current || !data || !windowId) return;
+    sending.current = true; setBusy(true); setError('');
+    try {
+      const result = await api(`/api/threads/${encodeURIComponent(thread.id)}/inheritance/repair`, {
+        method: 'POST', body: JSON.stringify({ confirmExistingMessages: true, expectedSourceId: data.source.id, windowId }),
+      });
+      if (!result.submitted || !result.verified) throw new Error('更正交接尚未确认发送。');
+      notify(`正确来源的交接已发送，可在原对话查看确认回复。${result.warning ? '窗口未到前台，可点击任务栏查看。' : ''}`);
+      await onRepaired();
+    } catch (problem) {
+      setError(problem.message);
+      if (problem.repair) setData(current => ({ ...current, submission: problem.repair }));
+    } finally { sending.current = false; setBusy(false); }
+  };
+  return <div className="modal-overlay"><section className="modal inherit-modal" role="dialog" aria-modal="true" aria-labelledby="repair-title" data-testid="repair-dialog">
+    <div className="modal-heading"><span className="modal-icon"><ArrowRightToLine size={21} /></span><button className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭补交接窗口"><X size={18} /></button></div>
+    <h2 id="repair-title">补交接修复</h2>
+    <p className="modal-description">保留现有对话记录，发送一条明确正确来源的更正消息，沿用原交接配置。Codex 本轮先确认任务、进度和关键路径，再等待你的业务指令。</p>
+    {loading && <p className="handoff-loading"><LoaderCircle size={14} className="spin" />正在核对来源和窗口…</p>}
+    {error && <p className="form-error" role="alert" data-testid="repair-error">{error}{!busy && <button className="handoff-retry" type="button" onClick={load}>重新读取</button>}</p>}
+    <form onSubmit={send}>
+      {data && <><p className="handoff-note" data-testid="repair-source">来源：{data.source.title}<br />{data.source.id}</p><InheritedSettings settings={data.settings} title="沿用来源配置" /><pre className="inheritance-prompt" data-testid="repair-prompt">{data.prompt}</pre></>}
+      {windows.length > 1 && <label className="field-label">目标 VS Code 窗口<select className="form-input" value={windowId} onChange={event => setWindowId(event.target.value)} disabled={busy} data-testid="repair-window"><option value="">选择窗口</option>{windows.map(window => <option key={window.id} value={window.id}>{window.title}</option>)}</select></label>}
+      <div className="modal-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="primary-button" data-testid="repair-submit" disabled={busy || loading || !data || !windowId}>{busy ? <LoaderCircle size={14} className="spin" /> : <ArrowRightToLine size={14} />}{busy ? '正在修复…' : data?.submission?.status === 'unknown' ? '核对修复结果' : '发送更正交接'}</button></div>
+    </form>
+  </section></div>;
+}
+
+function InheritedPrompt({ thread, notify, onStart, onRepair, starting }) {
   const threadId = thread.id;
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -698,19 +762,21 @@ function InheritedPrompt({ thread, notify, onStart, starting }) {
     pending: '交接提示词尚未发送。发送后可在 VS Code 看到提示词、思考和回复。',
     dispatching: '正在向 VS Code 发送交接提示词，等待确认…',
     submitted: '交接提示词已发送。在 VS Code 查看思考和回复，确认后继续交流。',
-    failed: '发送交接提示词失败。可重试发送到这条新对话。',
+    failed: '继承未完成：交接提示词没有确认发送。空对话可重试；已经交流的对话可补交接修复。',
+    needs_repair: '继承未完成：对话已有其他交流，需要补交接修复，明确正确来源。',
     unknown: '发送结果尚未确认。可核对这条对话的已有记录，避免重复发送。',
     legacy: '旧版交接资料未自动发送为可见消息；已继续交流的对话无需补发。',
   }[status] || '交接提示词的发送状态未知。';
   return <section className="inheritance-context" data-testid="inheritance-context">
-    <p className="handoff-note" data-testid="inheritance-submission-status" role="status">{statusText}</p>
+    <p className={`handoff-note ${status !== 'submitted' && status !== 'legacy' ? 'inheritance-incomplete-note' : ''}`} data-testid="inheritance-submission-status" role="status">{statusText}</p>
     {submission?.error && status !== 'submitted' && <p className="form-error" data-testid="inheritance-submission-error">{submission.error}</p>}
-    {status !== 'submitted' && <button className="primary-button full-width" data-testid="inheritance-start" onClick={onStart} disabled={starting || status === 'dispatching'}>{starting || status === 'dispatching' ? <LoaderCircle size={14} className="spin" /> : <ArrowRightToLine size={14} />}{status === 'dispatching' ? '正在发送…' : status === 'unknown' ? '核对发送结果并打开' : status === 'failed' ? '重试发送并打开' : '发送交接并打开'}</button>}
+    {status !== 'submitted' && <button className="primary-button full-width" data-testid="inheritance-start" onClick={status === 'needs_repair' ? onRepair : onStart} disabled={starting || status === 'dispatching'}>{starting || status === 'dispatching' ? <LoaderCircle size={14} className="spin" /> : <ArrowRightToLine size={14} />}{status === 'dispatching' ? '正在发送…' : status === 'needs_repair' ? '补交接修复' : status === 'unknown' ? '核对发送结果并打开' : status === 'failed' ? '重试发送并打开' : '发送交接并打开'}</button>}
+    {status === 'failed' && <button className="secondary-button full-width" data-testid="inheritance-repair" onClick={onRepair} disabled={starting}>已经交流？补交接修复</button>}
     {!expanded ? <button className="secondary-button full-width" onClick={load} aria-expanded="false" data-testid="show-inheritance"><ArrowRightToLine size={14} />查看交接提示词</button> : <>
       <div className="replies-heading"><strong>交接提示词</strong><button className="icon-button" title="复制交接提示词" aria-label="复制交接提示词" onClick={copyPrompt} disabled={loading || !result?.prompt} data-testid="inheritance-copy"><Copy size={13} /></button><button className="replies-collapse" onClick={collapse} data-testid="collapse-inheritance">收起</button></div>
       {loading && <p className="handoff-loading" role="status"><LoaderCircle size={13} className="spin" />正在读取交接提示词…</p>}
       {error && <div className="form-error" role="alert">{error}<button className="handoff-retry" onClick={load} data-testid="inheritance-retry">重试</button></div>}
-      {result && <><p className="handoff-note">来源：{result.source?.title || '原对话'}</p><InheritedSettings settings={result.settings} title="已继承配置" testId="inheritance-settings" /><pre className="inheritance-prompt" data-testid="inheritance-prompt">{result.prompt || '暂无可显示的交接提示词。'}</pre></>}
+      {result && <><p className="handoff-note">来源：{result.source?.title || '原对话'}</p><InheritedSettings settings={result.settings} title={status === 'submitted' ? '已继承配置' : '计划沿用的来源配置'} testId="inheritance-settings" /><pre className="inheritance-prompt" data-testid="inheritance-prompt">{result.prompt || '暂无可显示的交接提示词。'}</pre></>}
     </>}
   </section>;
 }

@@ -157,7 +157,7 @@ export class BoardStore {
     const thread = this.state.managedThreads[id];
     if (!UUID.test(id) || !thread?.inheritance) throw Object.assign(new Error('这条对话没有保存的交接提示词'), { status: 404 });
     if (!isRecord(submission) || Object.keys(submission).some(key => !['status', 'updatedAt', 'submissionId', 'turnId', 'error'].includes(key)) ||
-      !['pending', 'dispatching', 'submitted', 'failed', 'unknown'].includes(submission.status) ||
+      !['pending', 'dispatching', 'submitted', 'failed', 'unknown', 'needs_repair'].includes(submission.status) ||
       !Number.isSafeInteger(submission.updatedAt) || submission.updatedAt <= 0 ||
       (submission.submissionId !== undefined && !UUID.test(submission.submissionId)) ||
       (submission.turnId !== undefined && (typeof submission.turnId !== 'string' || !submission.turnId || submission.turnId.length > 200)) ||
@@ -173,6 +173,31 @@ export class BoardStore {
     this.save(nextState);
     this.state = nextState;
     return structuredClone(submission);
+  }
+
+  updateInheritanceRepair(id, { prompt, submission }) {
+    const thread = this.state.managedThreads[id];
+    if (!UUID.test(id) || !thread?.inheritance) throw Object.assign(new Error('这条对话没有保存的交接提示词'), { status: 404 });
+    if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 26000 || !isRecord(submission) ||
+      Object.keys(submission).some(key => !['status', 'updatedAt', 'submissionId', 'turnId', 'error'].includes(key)) ||
+      !['pending', 'dispatching', 'submitted', 'failed', 'unknown'].includes(submission.status) ||
+      !Number.isSafeInteger(submission.updatedAt) || submission.updatedAt <= 0 || !UUID.test(submission.submissionId || '') ||
+      (submission.turnId !== undefined && (typeof submission.turnId !== 'string' || !submission.turnId || submission.turnId.length > 200)) ||
+      (submission.error !== undefined && (typeof submission.error !== 'string' || submission.error.length > 1000))) throw new Error('补交接状态无效');
+    const prior = thread.inheritance.repair;
+    if (prior && (prior.prompt !== prompt || prior.submission.submissionId !== submission.submissionId)) throw Object.assign(new Error('补交接内容和发送标识不能改变'), { status: 409 });
+    if (prior?.submission.status === 'submitted' && submission.status !== 'submitted') throw Object.assign(new Error('已确认补交接不能再次发送'), { status: 409 });
+    const repair = { prompt, originalSubmission: prior?.originalSubmission || structuredClone(thread.inheritance.submission || null), submission: structuredClone(submission) };
+    const inheritance = { ...thread.inheritance, repair };
+    if (submission.status === 'submitted') inheritance.submission = { status: 'submitted',
+      submissionId: thread.inheritance.submission?.submissionId || submission.submissionId,
+      updatedAt: submission.updatedAt, ...(submission.turnId ? { turnId: submission.turnId } : {}) };
+    const nextState = { ...this.state, managedThreads: { ...this.state.managedThreads,
+      [id]: { ...thread, inheritance },
+    } };
+    this.save(nextState);
+    this.state = nextState;
+    return structuredClone(repair);
   }
 
   threads() {
@@ -208,6 +233,7 @@ export class BoardStore {
         ...(managed.inheritance ? { inheritanceSubmission: structuredClone(managed.inheritance.submission || {
           status: 'legacy', updatedAt: timestamp(row.created_at, row.created_at_ms) || Date.now(),
         }) } : {}),
+        ...(managed.inheritance?.repair ? { inheritanceRepair: structuredClone(managed.inheritance.repair.submission) } : {}),
         status: rollout.activity.status,
         activity: inheritedPreview && rollout.activity.status === 'unknown'
           ? { ...rollout.activity, reason: inheritanceStatus === 'submitted'

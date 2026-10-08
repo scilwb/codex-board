@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -6,7 +6,7 @@ import { connect } from 'node:net';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_FRAME = 16 * 1024 * 1024;
-const VERSIONS = { initialize: 0, 'thread-owner-discovery': 1, 'thread-follower-load-complete-history': 1, 'thread-follower-start-turn': 2 };
+const VERSIONS = { initialize: 0, 'thread-owner-discovery': 1, 'thread-follower-load-complete-history': 1, 'thread-follower-start-turn': 2, 'thread-follower-update-thread-settings': 2 };
 
 function failure(message, dispatched = false) {
   return Object.assign(new Error(message), { dispatched });
@@ -17,6 +17,27 @@ function inputText(input) {
   return input.filter(item => item?.type === 'text' || item?.type === 'input_text').map(item => item.text ?? '').join('\n');
 }
 
+function safeThreadSettings(state) {
+  const latest = state?.latestThreadSettings ?? {};
+  const mode = latest.collaborationMode ?? state?.latestCollaborationMode;
+  const result = {};
+  const model = latest.model ?? state?.latestModel;
+  if (typeof model === 'string') result.model = model;
+  const effort = latest.effort !== undefined ? latest.effort : state?.latestReasoningEffort;
+  if (effort === null || typeof effort === 'string') result.reasoningEffort = effort;
+  if (['default', 'plan'].includes(mode?.mode)) result.collaborationMode = mode.mode;
+  if (typeof mode?.settings?.model === 'string') result.collaborationModel = mode.settings.model;
+  const modeEffort = mode?.settings?.reasoning_effort;
+  if (modeEffort === null || typeof modeEffort === 'string') result.collaborationEffort = modeEffort;
+  const permissions = latest.activePermissionProfile?.id ?? latest.permissions ?? state?.currentPermissions?.activePermissionProfile?.id;
+  if (permissions === null || typeof permissions === 'string') result.permissions = permissions;
+  for (const key of ['approvalPolicy', 'serviceTier', 'summary']) {
+    const value = latest[key];
+    if (value === null || typeof value === 'string') result[key] = value;
+  }
+  return result;
+}
+
 // The native stream includes internal context and reasoning. Retain only the
 // public user inputs needed to verify a submission; never expose the snapshot.
 export function publicSubmissionState(state) {
@@ -24,8 +45,10 @@ export function publicSubmissionState(state) {
     ? Object.values(state.turnHistory.history?.entitiesByKey ?? {})
     : state?.turns ?? [];
   const seen = new Set();
+  const settings = safeThreadSettings(state);
   return {
     revision: 0,
+    ...(Object.keys(settings).length ? { settings } : {}),
     pending: (state?.unconfirmedTurnSubmissions?.length ?? 0) > 0 || state?.threadRuntimeStatus?.type === 'active'
       || turns.some(turn => !turn?.turnId && turn?.status === 'inProgress' && inputText(turn.params?.input)),
     turns: turns.filter(turn => {
@@ -39,6 +62,11 @@ export function publicSubmissionState(state) {
       text: inputText(turn.params?.input) || (turn.items ?? []).filter(item => item?.type === 'userMessage').map(item => inputText(item.content)).join('\n'),
     })),
   };
+}
+
+function userHistoryDigest(state) {
+  return createHash('sha256').update(JSON.stringify(state.turns.filter(turn => turn.text)
+    .map(({ turnId, text }) => ({ turnId, text })).sort((a, b) => a.turnId.localeCompare(b.turnId)))).digest('hex');
 }
 
 export class CodexIpcClient {
@@ -249,31 +277,78 @@ export class CodexIpcClient {
     }
   }
 
-  async submitInheritance(threadId, { prompt, settings = {}, submissionId, allowDispatch = true, historyEmptyVerified = false }) {
-    if (!UUID.test(submissionId ?? '') || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 24000) throw failure('继承提示词或发送标识无效。');
+  async submitRepair(threadId, { sourceThreadId, ...submission }) {
+    if (!UUID.test(sourceThreadId || '') || sourceThreadId === threadId) throw failure('补交接的来源对话无效。');
+    return this.submitInheritance(threadId, { ...submission, repairSourceId: sourceThreadId });
+  }
+
+  async applySourceSettings(threadId, owner, settings) {
+    const mode = typeof settings.collaborationMode === 'string' ? settings.collaborationMode : settings.collaborationMode?.mode;
+    const threadSettings = {
+      approvalPolicy: 'never', permissions: ':danger-full-access',
+      ...(settings.model ? { model: settings.model } : {}),
+      ...(settings.reasoningEffort !== undefined ? { effort: settings.reasoningEffort } : {}),
+      ...(settings.model && ['default', 'plan'].includes(mode) ? { collaborationMode: {
+        mode, settings: { model: settings.model, reasoning_effort: settings.reasoningEffort ?? null, developer_instructions: null },
+      } } : {}),
+      ...(settings.serviceTier !== undefined ? { serviceTier: settings.serviceTier } : {}),
+      ...(settings.summary !== undefined ? { summary: settings.summary } : {}),
+    };
+    // This idempotent metadata request never dispatches a user turn. It must
+    // update the actual owner after its UI resume, not a separate writer.
+    const response = await this.request('thread-follower-update-thread-settings', {
+      conversationId: threadId, threadSettings,
+    }, { targetClientId: owner });
+    if (response.result?.applied !== true) throw failure('Codex 没有确认来源配置已应用，交接提示词尚未发送。');
+  }
+
+  verifySourceSettings(state, expected) {
+    const actual = state.settings ?? {};
+    const mismatched = actual.approvalPolicy !== 'never' || actual.permissions !== ':danger-full-access'
+      || expected.model && (actual.model !== expected.model || actual.collaborationModel && actual.collaborationModel !== expected.model)
+      || expected.reasoningEffort !== undefined && (actual.reasoningEffort !== expected.reasoningEffort
+        || actual.collaborationEffort !== undefined && actual.collaborationEffort !== expected.reasoningEffort)
+      || expected.collaborationMode && actual.collaborationMode !== (typeof expected.collaborationMode === 'string' ? expected.collaborationMode : expected.collaborationMode.mode)
+      || expected.serviceTier !== undefined && actual.serviceTier !== expected.serviceTier
+      || expected.summary !== undefined && actual.summary !== expected.summary;
+    if (mismatched) throw failure('来源模型、思考模式或 Full Access 配置未能核对一致，交接提示词尚未发送。');
+  }
+
+  async submitInheritance(threadId, { prompt, settings = {}, submissionId, allowDispatch = true, historyEmptyVerified = false, repairSourceId }) {
+    if (repairSourceId !== undefined && (!UUID.test(repairSourceId) || repairSourceId.toLowerCase() === threadId.toLowerCase())) throw failure('补交接的来源对话无效。');
+    if (!UUID.test(submissionId ?? '') || typeof prompt !== 'string' || !prompt.trim() || prompt.length > (repairSourceId ? 26000 : 24000)) throw failure('继承提示词或发送标识无效。');
     const key = threadId;
     const existing = this.submissions.get(key);
     if (existing) {
-      if (existing.prompt !== prompt || existing.submissionId !== submissionId) throw failure('这个对话的继承提示词正在发送，请等待确认。');
+      if (existing.prompt !== prompt || existing.submissionId !== submissionId || existing.repairSourceId !== repairSourceId) throw failure('这个对话的继承提示词正在发送，请等待确认。');
       return existing.promise;
     }
-    const promise = this.performSubmission(threadId, { prompt, settings, submissionId, allowDispatch, historyEmptyVerified });
-    this.submissions.set(key, { prompt, submissionId, promise });
+    const promise = this.performSubmission(threadId, { prompt, settings, submissionId, allowDispatch, historyEmptyVerified, repairSourceId });
+    this.submissions.set(key, { prompt, submissionId, promise, repairSourceId });
     try { return await promise; }
     finally { this.submissions.delete(key); }
   }
 
-  async performSubmission(threadId, { prompt, settings, submissionId, allowDispatch, historyEmptyVerified }) {
+  async performSubmission(threadId, { prompt, settings, submissionId, allowDispatch, historyEmptyVerified, repairSourceId }) {
     let owner;
     try {
       owner = await this.discoverOwner(threadId);
-      const state = await this.readConversation(threadId, owner, { historyEmptyVerified, matchingPrompt: prompt });
+      let state = await this.readConversation(threadId, owner, { historyEmptyVerified, matchingPrompt: prompt });
       owner = state.owner;
       const existing = state.turns.find(turn => turn.text === prompt);
       if (existing) return { submitted: true, verified: true, reconciled: true, turnId: existing.turnId };
       if (allowDispatch === false) throw failure('发送结果仍未确认，已停止自动补发以避免重复，请先检查 VS Code。', true);
-      if (state.pending || state.turns.some(turn => turn.submissionId === submissionId)) throw failure('对话中存在尚未确认或不匹配的发送，请检查对话后重试。', true);
-      if (state.turns.some(turn => turn.text)) throw failure('新对话已有其他用户消息，已停止自动发送以避免重复。');
+      if (state.turns.some(turn => turn.submissionId === submissionId)) throw failure('对话中存在尚未确认或不匹配的发送，请检查对话后重试。', true);
+      if (state.pending) throw failure('对话已有正在处理或尚未确认的用户回合，请等待完成后重试。');
+      if (state.turns.some(turn => turn.text) && !repairSourceId) throw Object.assign(failure('该对话已有其他用户消息，继承未完成。请使用“补交接修复”，保留已有记录并明确纠正来源。'), { requiresRepair: true });
+      const digest = userHistoryDigest(state);
+      await this.applySourceSettings(threadId, owner, settings);
+      state = await this.readConversation(threadId, owner, { historyEmptyVerified, matchingPrompt: prompt });
+      owner = state.owner;
+      const confirmed = state.turns.find(turn => turn.text === prompt);
+      if (confirmed) return { submitted: true, verified: true, reconciled: true, turnId: confirmed.turnId };
+      if (state.pending || userHistoryDigest(state) !== digest) throw failure('发送交接前对话内容发生变化，请等待当前交流结束后重新核对。');
+      this.verifySourceSettings(state, settings);
       const mode = typeof settings.collaborationMode === 'string' ? settings.collaborationMode : settings.collaborationMode?.mode;
       const collaborationMode = settings.model && ['default', 'plan'].includes(mode)
         ? { mode, settings: { model: settings.model, reasoning_effort: settings.reasoningEffort ?? null, developer_instructions: null } }
@@ -286,14 +361,16 @@ export class CodexIpcClient {
         approvalPolicy: 'never',
         permissions: ':danger-full-access',
         ...(settings.model ? { model: settings.model } : {}),
-        ...(settings.reasoningEffort != null ? { effort: settings.reasoningEffort } : {}),
+        ...(settings.reasoningEffort !== undefined ? { effort: settings.reasoningEffort } : {}),
         ...(settings.serviceTier !== undefined ? { serviceTier: settings.serviceTier } : {}),
         ...(settings.summary !== undefined ? { summary: settings.summary } : {}),
         ...(collaborationMode ? { collaborationMode } : {}),
       };
       const response = await this.request('thread-follower-start-turn', {
         conversationId: threadId,
-        turnStart: { request, context: { inheritThreadSettings: true, useAppServerPermissionDefault: false } },
+        // Otherwise a stale target collaboration mode can override request.model
+        // when the source never explicitly recorded a collaboration mode.
+        turnStart: { request, context: { inheritThreadSettings: false, useAppServerPermissionDefault: false } },
       }, { targetClientId: owner, mutation: true });
       const result = response.result?.result;
       const turnId = result?.turn?.id;

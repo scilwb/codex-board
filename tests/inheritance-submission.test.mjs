@@ -37,6 +37,10 @@ async function setup(t, options = {}) {
     return { submitted: true, opened: true, verified: true, turnId: accepted.get(params.submissionId) };
   };
   const bridge = {
+    async submitRepair(id, params) {
+      submissions.push({ id, params, repair: true });
+      return options.repairSubmit ? options.repairSubmit(id, params, accept) : accept(id, params);
+    },
     async submitInheritance(id, params) {
       submissions.push({ id, params });
       return options.submit ? options.submit(id, params, accept) : accept(id, params);
@@ -353,4 +357,72 @@ test('状态写入拒绝改动发送标识或撤销已确认发送，未知字�
   const sent = store().inheritance(child.id).submission;
   assert.throws(() => store().updateInheritanceSubmission(child.id, { ...sent, submissionId: randomUUID() }), /标识不能改变/);
   assert.throws(() => store().updateInheritanceSubmission(child.id, { ...sent, status: 'pending' }), /不能再次提交/);
+});
+
+test('补交接必须明确确认正确来源，保留旧交流及原失败记录，重启重试不重复发送', async t => {
+  const { create, request, fixture, pathFor, store, submissions, restart } = await setup(t, {
+    submit() { throw Object.assign(new Error('窗口焦点被阻止'), { dispatched: false, status: 502 }); },
+  });
+  const sourceBefore = readFileSync(pathFor(fixture.ids[0]), 'utf8');
+  const child = await create('UMI项目的正确交接\n/home/example/UMI.md');
+  await request(submissionPath(child.id), 'POST', {});
+  appendFileSync(pathFor(child.id), JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'WAX项目的问题' } }) + '\n');
+  const before = readFileSync(pathFor(child.id), 'utf8');
+  const endpoint = `/api/threads/${child.id}/inheritance/repair`;
+  const preview = await request(endpoint);
+  assert.equal(preview.status, 200);
+  assert.equal(preview.body.source.id, fixture.ids[0]);
+  assert.match(preview.body.prompt, /唯一直接来源对话 ID/);
+  assert.match(preview.body.prompt, /IDE 当前打开的其他项目/);
+  assert.ok(preview.body.prompt.endsWith('UMI项目的正确交接\n/home/example/UMI.md'));
+  assert.equal((await request(endpoint, 'POST', { expectedSourceId: fixture.ids[0] })).status, 400);
+  assert.equal((await request(endpoint, 'POST', { confirmExistingMessages: true, expectedSourceId: fixture.ids[1] })).status, 400);
+  assert.equal(submissions.filter(item => item.repair).length, 0);
+  const body = { confirmExistingMessages: true, expectedSourceId: fixture.ids[0] };
+  const sent = await request(endpoint, 'POST', body);
+  assert.equal(sent.status, 200);
+  assert.equal(sent.body.submission.status, 'submitted');
+  assert.equal(sent.body.repair.status, 'submitted');
+  assert.equal(store().inheritance(child.id).repair.originalSubmission.status, 'failed');
+  assert.ok(readFileSync(pathFor(child.id), 'utf8').startsWith(before));
+  assert.equal(readFileSync(pathFor(fixture.ids[0]), 'utf8'), sourceBefore);
+  assert.equal(submissions.filter(item => item.repair).length, 1);
+  const snap = (await request('/api/snapshot')).body;
+  assert.equal(snap.threads.find(thread => thread.id === child.id).inheritanceRepair.status, 'submitted');
+  assert.ok(!JSON.stringify(snap).includes(preview.body.prompt));
+  await restart();
+  assert.equal((await request(endpoint, 'POST', body)).body.alreadySubmitted, true);
+  assert.equal(submissions.filter(item => item.repair).length, 1);
+});
+
+test('补交接回执丢失后保留相同提示词及标识，下一次仅核对原发送', async t => {
+  let first = true;
+  const { create, request, fixture, submissions, accepted, restart } = await setup(t, {
+    submit() { throw Object.assign(Error('原交接未发'), { dispatched: false }); },
+    repairSubmit(id, params, accept) {
+      const result = accept(id, params);
+      if (first) { first = false; throw Object.assign(Error('补交接回执丢失'), { dispatched: true }); }
+      assert.equal(params.allowDispatch, false);
+      return result;
+    },
+  });
+  const child = await create(); await request(submissionPath(child.id), 'POST', {});
+  const endpoint = `/api/threads/${child.id}/inheritance/repair`;
+  const body = { confirmExistingMessages: true, expectedSourceId: fixture.ids[0] };
+  const lost = await request(endpoint, 'POST', body);
+  assert.equal(lost.body.repair.status, 'unknown');
+  await restart();
+  const retry = await request(endpoint, 'POST', body);
+  assert.equal(retry.status, 200);
+  const repairs = submissions.filter(item => item.repair);
+  assert.equal(repairs[0].params.submissionId, repairs[1].params.submissionId);
+  assert.equal(repairs[0].params.prompt, repairs[1].params.prompt);
+  assert.equal(accepted.size, 1);
+});
+
+test('有其他消息的正常继承显示需要修复，不自动补发', async t => {
+  const { create, request } = await setup(t, { submit() { throw Object.assign(Error('需要明确补交接'), { dispatched: false, requiresRepair: true }); } });
+  const child = await create();
+  const result = await request(submissionPath(child.id), 'POST', {});
+  assert.equal(result.body.submission.status, 'needs_repair');
 });

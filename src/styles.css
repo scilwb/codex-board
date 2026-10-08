@@ -239,6 +239,8 @@ button { color: inherit; }
 .card-actions .card-inherit { color: #477d7e; white-space: nowrap; }
 .card-actions .card-inherit svg { flex-shrink: 0; }
 .inherit-badge { display: flex; flex-shrink: 0; align-items: center; gap: 3px; font-size: 9px; color: #5e8a8b; }
+.inherit-badge.incomplete { color: #9b6a23; font-weight: 600; }
+.inheritance-incomplete-note { padding: 9px 10px; background: #fff7e9; border: 1px solid #ebd7b7; border-radius: 6px; color: #8a632d; font-size: 12px; }
 .inherit-detail-button { color: #477d7e; border-color: #cddfdd; background: #f8fbfa; }
 .inherit-modal { width: 610px; }
 .inherit-origin { color: #5e8581; border-color: #d9e7e2; background: #f5faf7; }

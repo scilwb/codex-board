@@ -37,10 +37,19 @@ export class EditorBridge {
     if (previous && previous.pid !== body.pid) {
       previous.waiter?.(null);
       previous.cooldownUntil = 0;
-      if (previous.pending && this.commands.has(previous.pending.id)) previous.queued = { id: previous.pending.id, threadId: previous.pending.threadId };
+      if (previous.pending && this.commands.has(previous.pending.id)) previous.queued = { id: previous.pending.id, threadId: previous.pending.threadId, ...(previous.pending.allowUnfocused ? { allowUnfocused: true } : {}) };
     }
     this.clients.set(body.id, Object.assign(previous || {}, { id: body.id, title: body.title, pid: body.pid, folders: [...body.folders],
       openThreads: [...new Set(body.openThreads)], activeThreadId: body.activeThreadId || null, seenAt: Date.now() }));
+    // Older installed bridges report a focus failure after opening the tab and
+    // then register its actual active ID. Accept that fresh, authenticated
+    // identity proof only for inheritance; cached heartbeats never suffice.
+    const current = this.clients.get(body.id);
+    const pending = current.pending;
+    if (pending?.awaitActiveRegistration && current.activeThreadId === pending.threadId && current.openThreads.includes(pending.threadId)) {
+      this.completeOpen(pending, { windowFocused: false, activeThreadId: pending.threadId, reused: pending.reused,
+        warning: '交接目标标签已确认；系统未将窗口切到前台，可点击任务栏查看。' });
+    }
   }
 
   windows() {
@@ -60,7 +69,7 @@ export class EditorBridge {
       // A result POST may be lost after VS Code handled a command. Redeliver the
       // same ID on its next poll; the extension caches completed command IDs.
       const command = client.queued || (client.pending && this.commands.has(client.pending.id)
-        ? { id: client.pending.id, threadId: client.pending.threadId } : null);
+        ? { id: client.pending.id, threadId: client.pending.threadId, ...(client.pending.allowUnfocused ? { allowUnfocused: true } : {}) } : null);
       client.queued = null;
       return command && this.commands.has(command.id) ? command : null;
     };
@@ -83,7 +92,7 @@ export class EditorBridge {
     });
   }
 
-  open(threadId, windowId) {
+  open(threadId, windowId, { allowUnfocused = false } = {}) {
     if (!UUID.test(threadId)) throw failure('对话 ID 格式无效');
     const windows = this.windows();
     let client = windowId ? this.clients.get(windowId) : null;
@@ -95,14 +104,14 @@ export class EditorBridge {
       else throw failure(windows.length ? '请选择要定位的 VS Code 窗口' : 'VS Code 连接未就绪，请在 VS Code 运行 Codex Board: Connect', 503);
     }
     if (client.pending) {
-      if (client.pending.threadId === threadId) return client.pending.promise;
+      if (client.pending.threadId === threadId && client.pending.allowUnfocused === allowUnfocused) return client.pending.promise;
       throw failure('此窗口正在打开另一条对话，请等待完成', 409);
     }
     if (client.cooldownUntil > Date.now()) throw failure('上一次请求尚未完成，请先查看 VS Code，稍后再试', 409);
     const id = randomUUID();
     let resolve, reject;
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-    const pending = { id, clientId: client.id, threadId, promise, resolve, reject };
+    const pending = { id, clientId: client.id, threadId, promise, resolve, reject, allowUnfocused };
     pending.timer = setTimeout(() => {
       this.commands.delete(id);
       if (client.pending === pending) client.pending = null;
@@ -112,7 +121,7 @@ export class EditorBridge {
     }, this.timeoutMs);
     client.pending = pending;
     this.commands.set(id, pending);
-    const command = { id, threadId };
+    const command = { id, threadId, ...(allowUnfocused ? { allowUnfocused: true } : {}) };
     if (client.waiter) client.waiter(command);
     else client.queued = command;
     return promise;
@@ -124,22 +133,46 @@ export class EditorBridge {
     const pending = this.commands.get(body.commandId);
     if (!pending) return { ignored: true };
     if (pending.clientId !== body.clientId) throw failure('窗口响应不匹配', 403);
+    if (pending.allowUnfocused && body.status === 'error' && /^对话标签已定位，但系统未将 VS Code 窗口切到前台/.test(body.message || '')) {
+      pending.awaitActiveRegistration = true;
+      pending.reused = body.reused === true;
+      return { accepted: true };
+    }
+    if (pending.allowUnfocused && body.status === 'opened' && body.editorOpened === true && body.activeThreadId === pending.threadId && typeof body.windowFocused === 'boolean') {
+      this.completeOpen(pending, body);
+      return { accepted: true };
+    }
     clearTimeout(pending.timer);
     this.commands.delete(body.commandId);
     const client = this.clients.get(body.clientId);
     if (client?.pending === pending) client.pending = null;
     if (client) client.seenAt = Date.now();
-    if (body.status === 'error') pending.reject(failure(body.message || 'VS Code 打开失败', 502));
+    if (body.activeThreadId != null && body.activeThreadId !== pending.threadId) pending.reject(failure('VS Code 回执中的对话 ID 与目标不匹配，交接未发送。', 409));
+    else if (body.status === 'error') pending.reject(failure(body.message || 'VS Code 打开失败', 502));
     else if (body.windowFocused !== true) pending.reject(failure('桥接已更新，请在目标 VS Code 窗口执行 Developer: Reload Window 一次后重试', 409));
     else pending.resolve({ opened: true, editorOpened: true, windowFocused: true, verified: true, reused: body.reused === true, method: 'bridge',
       message: body.reused ? '已定位到已打开的对话' : '已打开 VS Code 对话标签', windowId: body.clientId });
     return { accepted: true };
   }
 
+  completeOpen(pending, result) {
+    clearTimeout(pending.timer);
+    this.commands.delete(pending.id);
+    const client = this.clients.get(pending.clientId);
+    if (client?.pending === pending) client.pending = null;
+    if (client?.queued?.id === pending.id) client.queued = null;
+    if (client) client.seenAt = Date.now();
+    pending.resolve({ opened: true, editorOpened: true, windowFocused: result.windowFocused === true,
+      activeThreadId: pending.threadId, verified: true, reused: result.reused === true,
+      method: 'bridge', windowId: pending.clientId,
+      message: result.reused ? '已定位到已打开的对话' : '已打开 VS Code 对话标签',
+      ...(typeof result.warning === 'string' ? { warning: result.warning } : {}) });
+  }
+
   async submitInheritance(threadId, { windowId, ...submission } = {}) {
     let opened;
     try {
-      opened = await this.open(threadId, windowId);
+      opened = await this.open(threadId, windowId, { allowUnfocused: true });
     } catch (error) {
       // Navigation has not dispatched a model request. Retrying the existing
       // child is safe even if VS Code's window acknowledgement was lost.
@@ -147,6 +180,14 @@ export class EditorBridge {
       throw error;
     }
     const sent = await this.ipc.submitInheritance(threadId, submission);
+    return { ...opened, ...sent };
+  }
+
+  async submitRepair(threadId, { windowId, ...submission } = {}) {
+    let opened;
+    try { opened = await this.open(threadId, windowId, { allowUnfocused: true }); }
+    catch (error) { error.dispatched = false; throw error; }
+    const sent = await this.ipc.submitRepair(threadId, submission);
     return { ...opened, ...sent };
   }
 
